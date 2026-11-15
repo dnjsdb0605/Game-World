@@ -149,10 +149,6 @@ export default function App() {
     engineRef.current?.setMobileInput(patch);
   };
 
-  const handleJump = () => {
-    engineRef.current?.triggerJump();
-  };
-
   const handleBell = () => {
     engineRef.current?.triggerBell();
   };
@@ -206,7 +202,6 @@ export default function App() {
           onToggleMute={handleToggleMute}
           onPause={handlePause}
           onMobileInput={handleMobileInput}
-          onJump={handleJump}
           onBell={handleBell}
         />
       )}

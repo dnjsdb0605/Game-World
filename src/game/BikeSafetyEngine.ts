@@ -1,5 +1,10 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { soundEngine } from './audio';
 import {
   createCarRig,
@@ -28,7 +33,10 @@ import {
   createContactShadowTexture,
   createPotholeTexture,
   createPuddleTexture,
+  createRoadNormalMap,
+  createRoadRoughnessMap,
   createRoadTexture,
+  createSidewalkNormalMap,
   createSidewalkTexture,
   createWarningChevronTexture,
 } from './textures';
@@ -118,21 +126,32 @@ export class BikeSafetyEngine {
   private container: HTMLElement;
   private callbacks: EngineCallbacks;
   private renderer!: THREE.WebGLRenderer;
+  private composer: EffectComposer | null = null;
+  private composerTarget: THREE.WebGLRenderTarget | null = null;
+  private bloomPass: UnrealBloomPass | null = null;
+  private speedGradePass: ShaderPass | null = null;
   private scene!: THREE.Scene;
   private camera!: THREE.PerspectiveCamera;
   private sunLight!: THREE.DirectionalLight;
+  private skyDomeMat!: THREE.ShaderMaterial;
+  private skyDomeMesh!: THREE.Mesh;
   private isSoftwareGl = false;
 
   private frameId = 0;
   private disposed = false;
   private lastTime = 0;
   private elapsed = 0;
+  private puddleUniformTime = { value: 0 };
 
   // Textures & shared resources
   private contactShadowTex!: THREE.CanvasTexture;
   private potholeTex!: THREE.CanvasTexture;
   private puddleTex!: THREE.CanvasTexture;
   private chevronTex!: THREE.CanvasTexture;
+  private roadNormalTex!: THREE.CanvasTexture;
+  private roadRoughnessTex!: THREE.CanvasTexture;
+  private sidewalkTex!: THREE.CanvasTexture;
+  private sidewalkNormalTex!: THREE.CanvasTexture;
   private roadTextures: THREE.CanvasTexture[] = [];
   private buildingTextures: THREE.CanvasTexture[] = [];
 
@@ -142,6 +161,8 @@ export class BikeSafetyEngine {
   private hazards: ActiveHazard[] = [];
   private pickups: ActivePickup[] = [];
   private particles: Particle[] = [];
+  private speedStreaksGroup!: THREE.Group;
+  private speedStreaks: { mesh: THREE.Mesh; speedMul: number }[] = [];
   private bellRingMesh!: THREE.Mesh;
   private bellRingLife = 0;
 
@@ -150,9 +171,6 @@ export class BikeSafetyEngine {
   private mode: DifficultyMode = 'city';
   private playerX = 3.2; // Start in the red Korean bike lane
   private playerVX = 0;
-  private playerY = 0;
-  private playerVY = 0;
-  private grounded = true;
   private speed = 10.5; // m/s (~38 km/h max, cruising ~22-30 km/h)
   private wheelAngle = 0;
   private crankAngle = 0;
@@ -178,8 +196,6 @@ export class BikeSafetyEngine {
 
   private bellCooldown = 0;
   private readonly bellCooldownMax = 1.2;
-  private jumpBufferTimer = 0;
-  private coyoteTimer = 0;
   private slipTimer = 0;
   private wrongLaneTimer = 0;
 
@@ -289,16 +305,32 @@ export class BikeSafetyEngine {
 
     const width = Math.max(1, this.container.clientWidth);
     const height = Math.max(1, this.container.clientHeight);
+    const pixelRatio = this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2);
 
-    this.renderer = new THREE.WebGLRenderer({
+    const canvas = document.createElement('canvas');
+    const gl2 = canvas.getContext('webgl2', {
       antialias: !this.isSoftwareGl,
       powerPreference: 'high-performance',
+      alpha: false,
     });
+
+    this.renderer = gl2
+      ? new THREE.WebGLRenderer({
+          canvas,
+          context: gl2,
+          antialias: !this.isSoftwareGl,
+          powerPreference: 'high-performance',
+        })
+      : new THREE.WebGLRenderer({
+          antialias: !this.isSoftwareGl,
+          powerPreference: 'high-performance',
+        });
+
     this.renderer.setSize(width, height);
-    this.renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
+    this.renderer.setPixelRatio(pixelRatio);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.08;
+    this.renderer.toneMappingExposure = 0.92;
     this.renderer.shadowMap.enabled = !this.isSoftwareGl;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.domElement.style.display = 'block';
@@ -307,23 +339,110 @@ export class BikeSafetyEngine {
     this.container.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
-    const skyColor = new THREE.Color(0xcce2f8);
-    this.scene.background = skyColor;
-    this.scene.fog = new THREE.Fog(skyColor, 48, 138);
+    const horizonColor = new THREE.Color(0xa6c8ea);
+    this.scene.background = horizonColor;
+    this.scene.fog = new THREE.Fog(horizonColor, 72, 175);
+
+    // WebGL2 GLSL3 Procedural Atmospheric Sky Dome (crisp blue sky + soft drifting clouds)
+    this.skyDomeMat = new THREE.ShaderMaterial({
+      glslVersion: THREE.GLSL3,
+      side: THREE.BackSide,
+      depthWrite: false,
+      fog: false,
+      uniforms: {
+        uTime: { value: 0 },
+        uSunDir: { value: new THREE.Vector3(0.42, 0.65, 0.35).normalize() },
+      },
+      vertexShader: /* glsl */ `
+        out vec3 vWorldDir;
+        void main() {
+          vWorldDir = normalize(position);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        precision highp float;
+        in vec3 vWorldDir;
+        uniform float uTime;
+        uniform vec3 uSunDir;
+        out vec4 fragColor;
+
+        float hash21(vec2 p) {
+          p = fract(p * vec2(123.34, 456.21));
+          p += dot(p, p + 45.32);
+          return fract(p.x * p.y);
+        }
+
+        float noise2(vec2 p) {
+          vec2 i = floor(p);
+          vec2 f = fract(p);
+          vec2 u = f * f * (3.0 - 2.0 * f);
+          float a = hash21(i);
+          float b = hash21(i + vec2(1.0, 0.0));
+          float c = hash21(i + vec2(0.0, 1.0));
+          float d = hash21(i + vec2(1.0, 1.0));
+          return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+        }
+
+        float fbm(vec2 p) {
+          float v = 0.0;
+          float a = 0.5;
+          for (int i = 0; i < 4; i++) {
+            v += a * noise2(p);
+            p *= 2.04;
+            a *= 0.5;
+          }
+          return v;
+        }
+
+        void main() {
+          vec3 dir = normalize(vWorldDir);
+          float h = clamp(dir.y, 0.0, 1.0);
+
+          vec3 zenith = vec3(0.12, 0.34, 0.72);
+          vec3 midSky = vec3(0.32, 0.58, 0.86);
+          vec3 horizon = vec3(0.68, 0.82, 0.94);
+
+          vec3 sky = mix(horizon, midSky, smoothstep(0.0, 0.28, h));
+          sky = mix(sky, zenith, smoothstep(0.22, 0.88, h));
+
+          // Soft sun corona without blinding glare
+          float sunDot = max(dot(dir, normalize(uSunDir)), 0.0);
+          sky += vec3(0.95, 0.84, 0.62) * pow(sunDot, 14.0) * 0.14;
+          sky += vec3(1.0, 0.96, 0.86) * smoothstep(0.996, 0.9992, sunDot) * 0.42;
+
+          // Drifting cloud layer
+          if (dir.y > 0.03) {
+            vec2 cloudUv = dir.xz / (dir.y + 0.18) * 1.45;
+            cloudUv.y -= uTime * 0.032;
+            cloudUv.x += uTime * 0.012;
+            float n = fbm(cloudUv);
+            float cloudMask = smoothstep(0.50, 0.75, n) * smoothstep(0.03, 0.22, dir.y);
+            vec3 cloudCol = mix(vec3(0.84, 0.89, 0.95), vec3(0.95, 0.91, 0.84), pow(sunDot, 4.0) * 0.35);
+            sky = mix(sky, cloudCol, cloudMask * 0.68);
+          }
+
+          fragColor = vec4(sky, 1.0);
+        }
+      `,
+    });
+    this.skyDomeMesh = new THREE.Mesh(new THREE.SphereGeometry(168, 32, 20), this.skyDomeMat);
+    this.scene.add(this.skyDomeMesh);
 
     const pmrem = new THREE.PMREMGenerator(this.renderer);
     this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    this.scene.environmentIntensity = 0.28;
     pmrem.dispose();
 
-    this.camera = new THREE.PerspectiveCamera(64, width / height, 0.1, 180);
+    this.camera = new THREE.PerspectiveCamera(64, width / height, 0.1, 200);
     this.camera.position.copy(this.camPos);
     this.camera.lookAt(this.camLook);
 
-    // Warm sunlit key + cool sky/ground hemisphere + subtle rim light
-    const hemi = new THREE.HemisphereLight(0xdbeafe, 0x64748b, 0.85);
+    // Balanced daylight key + sky/ground fill + subtle rim separation
+    const hemi = new THREE.HemisphereLight(0xcbe4ff, 0x475569, 0.52);
     this.scene.add(hemi);
 
-    this.sunLight = new THREE.DirectionalLight(0xfff1d6, 1.85);
+    this.sunLight = new THREE.DirectionalLight(0xfff3de, 1.3);
     this.sunLight.position.set(16, 28, 14);
     this.sunLight.castShadow = !this.isSoftwareGl;
     this.sunLight.shadow.mapSize.width = 1024;
@@ -340,7 +459,7 @@ export class BikeSafetyEngine {
     this.scene.add(this.sunLight);
     this.scene.add(this.sunLight.target);
 
-    const rimLight = new THREE.DirectionalLight(0xbae6fd, 0.55);
+    const rimLight = new THREE.DirectionalLight(0x93c5fd, 0.32);
     rimLight.position.set(-14, 12, -20);
     this.scene.add(rimLight);
 
@@ -349,6 +468,10 @@ export class BikeSafetyEngine {
     this.potholeTex = createPotholeTexture(maxAniso);
     this.puddleTex = createPuddleTexture(maxAniso);
     this.chevronTex = createWarningChevronTexture(maxAniso);
+    this.roadNormalTex = createRoadNormalMap(maxAniso);
+    this.roadRoughnessTex = createRoadRoughnessMap(maxAniso);
+    this.sidewalkTex = createSidewalkTexture(maxAniso);
+    this.sidewalkNormalTex = createSidewalkNormalMap(maxAniso);
     this.roadTextures = [
       createRoadTexture(maxAniso, false),
       createRoadTexture(maxAniso, true),
@@ -356,15 +479,72 @@ export class BikeSafetyEngine {
     for (let i = 0; i < 4; i++) {
       this.buildingTextures.push(createBuildingFacadeTexture(maxAniso, i));
     }
+
+    // WebGL2 MSAA HalfFloat Post-Processing Pipeline (Hardware GPU only)
+    // High bloom threshold (1.55) ensures only bright emissive lights (signals, blinkers, brake lights) glow
+    if (!this.isSoftwareGl) {
+      this.composerTarget = new THREE.WebGLRenderTarget(
+        Math.max(1, Math.floor(width * pixelRatio)),
+        Math.max(1, Math.floor(height * pixelRatio)),
+        {
+          type: THREE.HalfFloatType,
+          samples: 4,
+        }
+      );
+      this.composer = new EffectComposer(this.renderer, this.composerTarget);
+      this.composer.setPixelRatio(pixelRatio);
+      this.composer.setSize(width, height);
+      this.composer.addPass(new RenderPass(this.scene, this.camera));
+
+      this.bloomPass = new UnrealBloomPass(
+        new THREE.Vector2(width, height),
+        0.16,
+        0.25,
+        1.55
+      );
+      this.composer.addPass(this.bloomPass);
+
+      this.speedGradePass = new ShaderPass({
+        uniforms: {
+          tDiffuse: { value: null },
+          uSpeedRatio: { value: 0 },
+        },
+        vertexShader: /* glsl */ `
+          varying vec2 vUv;
+          void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: /* glsl */ `
+          uniform sampler2D tDiffuse;
+          uniform float uSpeedRatio;
+          varying vec2 vUv;
+          void main() {
+            vec2 centered = vUv - 0.5;
+            float dist = length(centered);
+            // Subtle speed chromatic edge & gentle focus vignette
+            float shift = uSpeedRatio * 0.0022 * dist;
+            vec2 dir = dist > 0.0001 ? centered / dist : vec2(0.0);
+            float r = texture2D(tDiffuse, vUv + dir * shift).r;
+            float g = texture2D(tDiffuse, vUv).g;
+            float b = texture2D(tDiffuse, vUv - dir * shift).b;
+            vec3 col = vec3(r, g, b);
+            float vig = 1.0 - smoothstep(0.48, 0.98, dist) * (0.12 + uSpeedRatio * 0.12);
+            col *= vig;
+            gl_FragColor = vec4(col, 1.0);
+          }
+        `,
+      });
+      this.composer.addPass(this.speedGradePass);
+      this.composer.addPass(new OutputPass());
+    }
   }
 
   private buildEnvironment(): void {
-    const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
-    const sidewalkTex = createSidewalkTexture(maxAniso);
-
     // Wide ground plane extending out to horizon so world is never boxed in a void
-    const groundMat = new THREE.MeshStandardMaterial({ color: 0x6b7f5e, roughness: 0.95 });
-    const ground = new THREE.Mesh(new THREE.PlaneGeometry(320, 320), groundMat);
+    const groundMat = new THREE.MeshStandardMaterial({ color: 0x5c7150, roughness: 0.95 });
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(340, 340), groundMat);
     ground.rotation.x = -Math.PI / 2;
     ground.position.set(0, 0, -40);
     ground.receiveShadow = true;
@@ -372,22 +552,33 @@ export class BikeSafetyEngine {
 
     const roadMatNormal = new THREE.MeshStandardMaterial({
       map: this.roadTextures[0],
-      roughness: 0.85,
+      normalMap: this.roadNormalTex,
+      normalScale: new THREE.Vector2(0.6, 0.6),
+      roughnessMap: this.roadRoughnessTex,
+      roughness: 0.94,
       metalness: 0.04,
     });
     const roadMatCross = new THREE.MeshStandardMaterial({
       map: this.roadTextures[1],
-      roughness: 0.85,
+      normalMap: this.roadNormalTex,
+      normalScale: new THREE.Vector2(0.6, 0.6),
+      roughnessMap: this.roadRoughnessTex,
+      roughness: 0.94,
       metalness: 0.04,
     });
     const sidewalkMat = new THREE.MeshStandardMaterial({
-      map: sidewalkTex,
-      roughness: 0.88,
+      color: 0xaab4c2,
+      map: this.sidewalkTex,
+      normalMap: this.sidewalkNormalTex,
+      normalScale: new THREE.Vector2(0.5, 0.5),
+      roughness: 0.9,
       metalness: 0.02,
     });
-    const curbMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, roughness: 0.8 });
+    const curbMat = new THREE.MeshStandardMaterial({ color: 0x7c8b9e, roughness: 0.85 });
     const poleMat = new THREE.MeshStandardMaterial({ color: 0x475569, metalness: 0.6, roughness: 0.35 });
-    const lampMat = new THREE.MeshStandardMaterial({ color: 0xfef3c7, emissive: 0xfde68a, emissiveIntensity: 0.6 });
+    const lampMat = new THREE.MeshStandardMaterial({ color: 0xfef3c7, emissive: 0xfde68a, emissiveIntensity: 0.65 });
+    const fencePostMat = new THREE.MeshStandardMaterial({ color: 0xeab308, roughness: 0.52, metalness: 0.2 });
+    const fenceRailMat = new THREE.MeshStandardMaterial({ color: 0xdbe3ec, roughness: 0.5, metalness: 0.15 });
 
     for (let i = 0; i < NUM_SEGMENTS; i++) {
       const segGroup = new THREE.Group();
@@ -395,7 +586,7 @@ export class BikeSafetyEngine {
       const zPos = 18 - i * SEGMENT_LEN;
       segGroup.position.z = zPos;
 
-      // Asphalt surface elevated by 0.02m above base ground
+      // Asphalt surface elevated by 0.025m above base ground
       const roadMesh = new THREE.Mesh(
         new THREE.PlaneGeometry(10.4, SEGMENT_LEN),
         hasCrosswalk ? roadMatCross : roadMatNormal
@@ -405,7 +596,7 @@ export class BikeSafetyEngine {
       roadMesh.receiveShadow = true;
       segGroup.add(roadMesh);
 
-      // Left & Right sidewalks (raised curb at y=0.14)
+      // Left & Right sidewalks (raised curb at y=0.14) + pedestrian safety guardrails
       [-8.4, 8.4].forEach((sx) => {
         const sw = new THREE.Mesh(new THREE.BoxGeometry(6.4, 0.14, SEGMENT_LEN), sidewalkMat);
         sw.position.set(sx, 0.07, 0);
@@ -416,6 +607,26 @@ export class BikeSafetyEngine {
         const curb = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.17, SEGMENT_LEN), curbMat);
         curb.position.set(curbX, 0.085, 0);
         segGroup.add(curb);
+
+        // Korean school-zone yellow/white pedestrian guardrails (leave openings on crosswalk segments)
+        const fenceX = sx > 0 ? 5.42 : -5.42;
+        const railRuns = hasCrosswalk ? [-12, 12] : [-12, 0, 12];
+        railRuns.forEach((rz) => {
+          const railSpan = 9.5;
+          const topRail = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.07, railSpan), fenceRailMat);
+          topRail.position.set(fenceX, 0.92, rz);
+          segGroup.add(topRail);
+
+          const midRail = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.06, railSpan), fencePostMat);
+          midRail.position.set(fenceX, 0.56, rz);
+          segGroup.add(midRail);
+
+          [-4.2, 0, 4.2].forEach((pz) => {
+            const post = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.045, 0.9, 8), fencePostMat);
+            post.position.set(fenceX, 0.55, rz + pz);
+            segGroup.add(post);
+          });
+        });
       });
 
       // Roadside trees & streetlights
@@ -504,6 +715,28 @@ export class BikeSafetyEngine {
       this.scene.add(mesh);
       this.particles.push({ mesh, vx: 0, vy: 0, vz: 0, life: 0, maxLife: 0.4 });
     }
+
+    // Subtle 3D peripheral wind streaks when cycling fast
+    this.speedStreaksGroup = new THREE.Group();
+    const streakGeo = new THREE.BoxGeometry(0.025, 0.025, 2.2);
+    for (let i = 0; i < 16; i++) {
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xe0f2fe,
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+      });
+      const mesh = new THREE.Mesh(streakGeo, mat);
+      const side = i % 2 === 0 ? -1 : 1;
+      mesh.position.set(
+        side * (2.6 + Math.random() * 2.8),
+        0.9 + Math.random() * 2.1,
+        -4 - Math.random() * 24
+      );
+      this.speedStreaksGroup.add(mesh);
+      this.speedStreaks.push({ mesh, speedMul: 1.4 + Math.random() * 0.8 });
+    }
+    this.scene.add(this.speedStreaksGroup);
   }
 
   private spawnBurst(x: number, y: number, z: number, colorHex: number, count: number, spread = 4.5): void {
@@ -536,10 +769,18 @@ export class BikeSafetyEngine {
     if (this.disposed) return;
     const width = Math.max(1, this.container.clientWidth);
     const height = Math.max(1, this.container.clientHeight);
+    const pixelRatio = this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2);
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height);
-    this.renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
+    this.renderer.setPixelRatio(pixelRatio);
+    if (this.composer) {
+      this.composer.setPixelRatio(pixelRatio);
+      this.composer.setSize(width, height);
+    }
+    if (this.bloomPass) {
+      this.bloomPass.resolution.set(width, height);
+    }
   };
 
   private handleBlur = (): void => {
@@ -576,11 +817,15 @@ export class BikeSafetyEngine {
     const wasHeld = this.heldKeys.has(code);
     this.heldKeys.add(code);
 
-    // Edge-triggered actions
+    // Edge-triggered horn/bell action (E, Space, Shift, F)
     if (!wasHeld) {
-      if (code === 'Space') {
-        this.triggerJump();
-      } else if (code === 'KeyE' || code === 'ShiftLeft' || code === 'ShiftRight' || code === 'KeyF') {
+      if (
+        code === 'Space' ||
+        code === 'KeyE' ||
+        code === 'ShiftLeft' ||
+        code === 'ShiftRight' ||
+        code === 'KeyF'
+      ) {
         this.triggerBell();
       }
     }
@@ -593,12 +838,6 @@ export class BikeSafetyEngine {
   // Public Controls for React UI / Touch
   public setMobileInput(patch: Partial<MobileInputState>): void {
     this.mobileInput = { ...this.mobileInput, ...patch };
-  }
-
-  public triggerJump(): void {
-    if (this.phase !== 'playing') return;
-    soundEngine.unlock();
-    this.jumpBufferTimer = 0.14;
   }
 
   public triggerBell(): void {
@@ -672,9 +911,6 @@ export class BikeSafetyEngine {
 
     this.playerX = 3.2;
     this.playerVX = 0;
-    this.playerY = 0;
-    this.playerVY = 0;
-    this.grounded = true;
     this.speed = mode === 'school' ? 9.5 : 11.2;
     this.distanceM = 0;
     this.score = 0;
@@ -736,7 +972,6 @@ export class BikeSafetyEngine {
     this.clearEntities();
     this.phase = 'title';
     this.playerX = 3.2;
-    this.playerY = 0;
     this.speed = 9.2;
     this.bikeRig.root.visible = true;
     this.bikeRig.shieldBubble.visible = false;
@@ -800,7 +1035,11 @@ export class BikeSafetyEngine {
     const dt = Math.min(Math.max(rawDt, 0.001), 0.05);
 
     this.update(dt);
-    this.renderer.render(this.scene, this.camera);
+    if (this.composer && !this.isSoftwareGl) {
+      this.composer.render();
+    } else {
+      this.renderer.render(this.scene, this.camera);
+    }
 
     if (this.isSoftwareGl) {
       this.afterDraw(() => this.loop(performance.now()));
@@ -832,6 +1071,9 @@ export class BikeSafetyEngine {
 
   private update(dt: number): void {
     this.elapsed += dt;
+    this.puddleUniformTime.value = this.elapsed;
+    this.skyDomeMat.uniforms.uTime.value = this.elapsed;
+    this.skyDomeMesh.position.set(this.playerX, 0, -24);
 
     if (this.phase === 'paused' || this.phase === 'gameover' || this.phase === 'victory') {
       soundEngine.updateRollingSound(0, true, false);
@@ -902,7 +1144,6 @@ export class BikeSafetyEngine {
     if (this.bellCooldown > 0) this.bellCooldown = Math.max(0, this.bellCooldown - dt);
     if (this.invulnTimer > 0) this.invulnTimer = Math.max(0, this.invulnTimer - dt);
     if (this.doubleScoreTimer > 0) this.doubleScoreTimer = Math.max(0, this.doubleScoreTimer - dt);
-    if (this.jumpBufferTimer > 0) this.jumpBufferTimer = Math.max(0, this.jumpBufferTimer - dt);
     if (this.calloutTimer > 0) {
       this.calloutTimer -= dt;
       if (this.calloutTimer <= 0) this.activeCallout = null;
@@ -947,7 +1188,7 @@ export class BikeSafetyEngine {
 
     // Brake light & brake audio
     this.bikeRig.tailLightMat.emissiveIntensity = brake ? 3.2 : 0.65;
-    if (brake && this.speed > 5.0 && this.brakeSoundCooldown <= 0 && this.grounded) {
+    if (brake && this.speed > 5.0 && this.brakeSoundCooldown <= 0) {
       soundEngine.playBrake();
       this.brakeSoundCooldown = 0.25;
       this.spawnBurst(this.playerX, 0.08, 0.6, 0x94a3b8, 2, 1.5);
@@ -974,34 +1215,6 @@ export class BikeSafetyEngine {
     this.playerX += this.playerVX * dt;
     this.playerX = THREE.MathUtils.clamp(this.playerX, -ROAD_HALF_WIDTH, ROAD_HALF_WIDTH);
 
-    // Coyote time & buffered jump
-    if (this.grounded) {
-      this.coyoteTimer = 0.09;
-    } else {
-      this.coyoteTimer = Math.max(0, this.coyoteTimer - dt);
-    }
-
-    if (this.jumpBufferTimer > 0 && this.coyoteTimer > 0) {
-      this.playerVY = 8.4;
-      this.grounded = false;
-      this.jumpBufferTimer = 0;
-      this.coyoteTimer = 0;
-      soundEngine.playJump();
-      this.spawnBurst(this.playerX, 0.08, 0.3, 0xe2e8f0, 5, 2.2);
-    }
-
-    // Vertical physics
-    if (!this.grounded) {
-      this.playerVY -= 23.5 * dt;
-      this.playerY += this.playerVY * dt;
-      if (this.playerY <= 0) {
-        this.playerY = 0;
-        this.playerVY = 0;
-        this.grounded = true;
-        this.spawnBurst(this.playerX, 0.08, 0.3, 0xcbd5e1, 4, 2.0);
-      }
-    }
-
     // Distance & continuous riding score
     const deltaDist = this.speed * dt;
     this.distanceM += deltaDist;
@@ -1014,8 +1227,8 @@ export class BikeSafetyEngine {
     this.leanAngle = THREE.MathUtils.damp(this.leanAngle, -this.playerVX * 0.075, 10, dt);
     this.steerVisual = THREE.MathUtils.damp(this.steerVisual, -this.playerVX * 0.045, 12, dt);
 
-    this.bikeRig.root.position.set(this.playerX, this.playerY, 0);
-    this.bikeRig.contactShadow.scale.setScalar(Math.max(0.55, 1 - this.playerY * 0.35));
+    this.bikeRig.root.position.set(this.playerX, 0, 0);
+    this.bikeRig.contactShadow.scale.setScalar(1);
     this.bikeRig.shieldBubble.visible = this.hasShield;
     if (this.hasShield) {
       this.bikeRig.shieldBubble.rotation.y += dt * 1.5;
@@ -1030,7 +1243,7 @@ export class BikeSafetyEngine {
     this.animateBikeRig(this.leanAngle, this.steerVisual);
 
     // Rolling sound
-    soundEngine.updateRollingSound((this.speed - 2) / 14, this.grounded, true);
+    soundEngine.updateRollingSound((this.speed - 2) / 14, true, true);
   }
 
   private animateBikeRig(lean: number, steer: number): void {
@@ -1297,7 +1510,7 @@ export class BikeSafetyEngine {
         z,
         width: 1.35,
         depth: 1.35,
-        height: 0.25, // Jumpable!
+        height: 0.25,
         passed: false,
         hit: false,
         nearMissAwarded: false,
@@ -1325,7 +1538,7 @@ export class BikeSafetyEngine {
         z,
         width: 1.75,
         depth: 0.65,
-        height: 0.68, // Low enough to bunny-hop or steer around!
+        height: 0.68,
         passed: false,
         hit: false,
         nearMissAwarded: false,
@@ -1499,18 +1712,46 @@ export class BikeSafetyEngine {
     } else if (type === 'puddle') {
       const group = new THREE.Group();
       const x = [3.2, 2.5, 0.7][id % 3];
+      const puddleMat = new THREE.MeshPhysicalMaterial({
+        map: this.puddleTex,
+        transparent: true,
+        roughness: 0.06,
+        metalness: 0.18,
+        clearcoat: 1.0,
+        clearcoatRoughness: 0.06,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1,
+      });
+      puddleMat.onBeforeCompile = (shader) => {
+        shader.uniforms.uRippleTime = this.puddleUniformTime;
+        shader.vertexShader = shader.vertexShader.replace(
+          '#include <common>',
+          `#include <common>
+           varying vec2 vPuddleUv;`
+        );
+        shader.vertexShader = shader.vertexShader.replace(
+          '#include <uv_vertex>',
+          `#include <uv_vertex>
+           vPuddleUv = uv;`
+        );
+        shader.fragmentShader = shader.fragmentShader.replace(
+          '#include <common>',
+          `#include <common>
+           uniform float uRippleTime;
+           varying vec2 vPuddleUv;`
+        );
+        shader.fragmentShader = shader.fragmentShader.replace(
+          '#include <dithering_fragment>',
+          `float dCenter = length(vPuddleUv - vec2(0.5));
+           float ripple = sin(dCenter * 42.0 - uRippleTime * 5.2) * 0.5 + 0.5;
+           gl_FragColor.rgb += vec3(0.08, 0.16, 0.22) * ripple * smoothstep(0.45, 0.05, dCenter);
+           #include <dithering_fragment>`
+        );
+      };
       const puddleMesh = new THREE.Mesh(
         new THREE.PlaneGeometry(1.9, 2.2),
-        new THREE.MeshPhysicalMaterial({
-          map: this.puddleTex,
-          transparent: true,
-          roughness: 0.08,
-          metalness: 0.15,
-          clearcoat: 1.0,
-          polygonOffset: true,
-          polygonOffsetFactor: -1,
-          polygonOffsetUnits: -1,
-        })
+        puddleMat
       );
       puddleMesh.rotation.x = -Math.PI / 2;
       puddleMesh.position.y = 0.04;
@@ -1752,15 +1993,14 @@ export class BikeSafetyEngine {
           const bikeHalfD = 0.72;
           const overlapX = this.playerX + bikeHalfW > hazMinX && this.playerX - bikeHalfW < hazMaxX;
           const overlapZ = bikeHalfD > hazMinZ && -bikeHalfD < hazMaxZ;
-          const overlapY = this.playerY < h.height;
 
-          if (overlapX && overlapZ && overlapY) {
+          if (overlapX && overlapZ) {
             h.hit = true;
             const msgMap: Record<HazardType, string> = {
               dooring: '개문 사고 충돌! 주차 차량과 1m 거리를 두세요',
               blind_car: '사각지대 차량 충돌! 교차로 감속이 필요합니다',
-              smombie: '보행자 충돌! 벨(E)로 미리 알리고 서행하세요',
-              pothole: '노면 배수구 전복! 점프(Space)나 조향으로 피하세요',
+              smombie: '보행자 충돌! 벨(E/Space)로 미리 알리고 서행하세요',
+              pothole: '노면 배수구 전복! 감속(S) 후 조향으로 우회하세요',
               roadwork: '공사 장애물 충돌! 전방을 살피고 미리 차선 변경하세요',
               scooter: '전방 급정거 추돌! 충분한 안전거리를 유지하세요',
               red_signal: '적색 신호 위반!',
@@ -1768,25 +2008,26 @@ export class BikeSafetyEngine {
               pet: '애완동물과 충돌! 인도 근처에선 서행·경적 필수입니다',
               kids: '어린이 보행자와 충돌! 스쿨존에서는 반드시 서행하세요',
               wrong_way_bike: '역주행 자전거와 정면 충돌! 전방 주시 및 감속 필수',
-              puddle: '물웅덩이 수막현상 미끄러짐! 점프(Space)나 우회가 필요합니다',
-              gravel: '돌맹이·자갈 밟아 핸들 흔들림! 노면을 살피고 피하세요',
+              puddle: '물웅덩이 수막현상 미끄러짐! 감속(S) 및 우회가 필요합니다',
+              gravel: '돌맹이·자갈 밟아 핸들 흔들림! 감속 후 안전하게 피하세요',
             };
             this.onHazardHit(h, msgMap[h.type]);
           } else if (!h.nearMissAwarded && h.z > 0.3 && h.z < 2.2) {
-            // Near-miss reward if close horizontally or jumped cleanly over!
+            // Near-miss or safe defensive braking reward
             const distToEdge = Math.min(
               Math.abs(this.playerX - hazMinX),
               Math.abs(this.playerX - hazMaxX)
             );
             if (
-              overlapX &&
-              !overlapY &&
+              !overlapX &&
+              distToEdge < 1.1 &&
+              this.speed < 6.8 &&
               (h.type === 'pothole' || h.type === 'roadwork' || h.type === 'puddle' || h.type === 'gravel')
             ) {
               h.nearMissAwarded = true;
-              this.nearMissCount++;
+              this.defensiveCount++;
               soundEngine.playNearMiss(this.combo);
-              this.awardBonus('점프 회피 성공!', 140, 'good');
+              this.awardBonus('감속 안전 통과!', 150, 'good');
             } else if (!overlapX && distToEdge < 0.78) {
               h.nearMissAwarded = true;
               this.nearMissCount++;
@@ -1865,7 +2106,7 @@ export class BikeSafetyEngine {
       p.group.rotation.y += dt * 2.4;
       p.group.position.y = Math.sin(this.elapsed * 4 + i) * 0.1;
 
-      if (!p.collected && Math.abs(p.z) < 1.15 && Math.abs(this.playerX - p.x) < 0.9 && this.playerY < 1.4) {
+      if (!p.collected && Math.abs(p.z) < 1.15 && Math.abs(this.playerX - p.x) < 0.9) {
         p.collected = true;
         soundEngine.playPickup();
         this.spawnBurst(p.x, 0.8, 0, 0x22c55e, 10, 4.2);
@@ -1907,16 +2148,34 @@ export class BikeSafetyEngine {
       p.mesh.rotation.y += dt * 5;
       (p.mesh.material as THREE.MeshBasicMaterial).opacity = Math.max(0, p.life / p.maxLife);
     }
+
+    // Animate peripheral speed streaks at higher speeds
+    const fastRatio = THREE.MathUtils.clamp((this.speed - 11.2) / 5.5, 0, 1);
+    for (const s of this.speedStreaks) {
+      const mat = s.mesh.material as THREE.MeshBasicMaterial;
+      mat.opacity = fastRatio * 0.34;
+      s.mesh.visible = fastRatio > 0.02;
+      if (s.mesh.visible) {
+        s.mesh.position.z += this.speed * s.speedMul * dt;
+        if (s.mesh.position.z > 4) {
+          s.mesh.position.z = -26 - Math.random() * 10;
+        }
+      }
+    }
   }
 
   private updateCamera(dt: number): void {
     // GTA-style dynamic 3rd-person chase camera with FOV speed expansion + shake
     const speedRatio = THREE.MathUtils.clamp((this.speed - 4) / 12, 0, 1);
+    if (this.speedGradePass) {
+      this.speedGradePass.uniforms.uSpeedRatio.value = speedRatio;
+    }
+
     const targetFov = 61 + speedRatio * 10;
     this.camera.fov = THREE.MathUtils.damp(this.camera.fov, targetFov, 6, dt);
     this.camera.updateProjectionMatrix();
 
-    _vec3A.set(this.playerX * 0.88, 2.35 + this.playerY * 0.45, 4.35 + speedRatio * 0.35);
+    _vec3A.set(this.playerX * 0.88, 2.35, 4.35 + speedRatio * 0.35);
     this.camPos.lerp(_vec3A, 1 - Math.exp(-9 * dt));
 
     if (this.shakeIntensity > 0.005) {
@@ -1930,7 +2189,7 @@ export class BikeSafetyEngine {
       this.camera.position.copy(this.camPos);
     }
 
-    _vec3B.set(this.playerX * 0.72, 1.05 + this.playerY * 0.3, -9.5);
+    _vec3B.set(this.playerX * 0.72, 1.05, -9.5);
     this.camLook.lerp(_vec3B, 1 - Math.exp(-11 * dt));
     this.camera.lookAt(this.camLook);
     this.camera.rotation.z = -this.leanAngle * 0.14;
@@ -2032,8 +2291,14 @@ export class BikeSafetyEngine {
     this.potholeTex?.dispose();
     this.puddleTex?.dispose();
     this.chevronTex?.dispose();
+    this.roadNormalTex?.dispose();
+    this.roadRoughnessTex?.dispose();
+    this.sidewalkTex?.dispose();
+    this.sidewalkNormalTex?.dispose();
     this.roadTextures.forEach((t) => t.dispose());
     this.buildingTextures.forEach((t) => t.dispose());
+    this.composer?.dispose();
+    this.composerTarget?.dispose();
     this.renderer.dispose();
     if (this.renderer.domElement.parentElement === this.container) {
       this.container.removeChild(this.renderer.domElement);

@@ -105,7 +105,7 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
                 <span>주행 시작</span>
               </button>
               <span className="hidden sm:inline text-xs text-slate-400">
-                Enter 또는 Space 키로 바로 시작
+                Enter 키로 바로 시작
               </span>
             </div>
           </div>
@@ -130,9 +130,7 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
           <span className="mx-2 text-slate-500">·</span>
           <span className="font-bold text-amber-300">S</span> 브레이크
           <span className="mx-2 text-slate-500">·</span>
-          <span className="font-bold text-amber-300">Space</span> 점프
-          <span className="mx-2 text-slate-500">·</span>
-          <span className="font-bold text-sky-300">E</span> 경적(벨)
+          <span className="font-bold text-sky-300">E / Space</span> 경적(벨)
           <span className="mx-2 text-slate-500">·</span>
           <span className="font-bold text-slate-300">Esc</span> 일시정지
         </div>

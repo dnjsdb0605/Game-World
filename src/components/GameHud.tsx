@@ -8,7 +8,6 @@ interface GameHudProps {
   onToggleMute: () => void;
   onPause: () => void;
   onMobileInput: (patch: Partial<MobileInputState>) => void;
-  onJump: () => void;
   onBell: () => void;
 }
 
@@ -18,7 +17,6 @@ export const GameHud: React.FC<GameHudProps> = ({
   onToggleMute,
   onPause,
   onMobileInput,
-  onJump,
   onBell,
 }) => {
   const progressPct = hud.targetDistanceM
@@ -201,13 +199,9 @@ export const GameHud: React.FC<GameHudProps> = ({
             <strong className="text-white">W/S</strong> 가속·브레이크
           </span>
           <span className="text-slate-600">·</span>
-          <span>
-            <strong className="text-white">Space</strong> 점프
-          </span>
-          <span className="text-slate-600">·</span>
           <span className="inline-flex items-center gap-1.5">
             <Bell className="w-3.5 h-3.5 text-sky-300" />
-            <strong className="text-sky-300">E</strong> 경적
+            <strong className="text-sky-300">E / Space</strong> 경적
             <span className="inline-block w-10 h-1.5 bg-slate-800 rounded-full overflow-hidden">
               <span
                 className="block h-full bg-sky-400"
@@ -224,23 +218,16 @@ export const GameHud: React.FC<GameHudProps> = ({
             onPointerDown={() => onMobileInput({ brake: true })}
             onPointerUp={() => onMobileInput({ brake: false })}
             onPointerLeave={() => onMobileInput({ brake: false })}
-            className="px-3 h-12 rounded-xl bg-rose-950/88 border border-rose-400/40 text-rose-200 text-xs font-bold"
+            className="px-4 h-12 rounded-xl bg-rose-950/88 border border-rose-400/40 text-rose-200 text-xs font-bold"
           >
-            감속
+            브레이크
           </button>
           <button
             type="button"
             onClick={onBell}
-            className="px-3 h-12 rounded-xl bg-sky-950/88 border border-sky-400/40 text-sky-200 text-xs font-bold"
+            className="px-4 h-12 rounded-xl bg-sky-950/88 border border-sky-400/40 text-sky-200 text-xs font-bold"
           >
             경적
-          </button>
-          <button
-            type="button"
-            onClick={onJump}
-            className="px-3 h-12 rounded-xl bg-amber-500/90 text-slate-950 text-xs font-black"
-          >
-            점프
           </button>
         </div>
       </div>

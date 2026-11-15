@@ -30,8 +30,8 @@ export const SAFETY_LESSONS: Record<HazardType, SafetyLesson> = {
     title: '노면 파손 · 빗물받이 배수구',
     shortTag: '도로 파손',
     dangerReason: '자전거 바퀴 폭보다 넓은 배수구 틈이나 포트홀에 앞바퀴가 빠지면 핸들이 꺾여 전복될 수 있습니다.',
-    preventionTip: '전방 노면 상태를 항상 10m 앞에서 살피고, 젖은 배수구 덮개는 미끄러우므로 비켜가세요.',
-    counterplayHint: 'Space(점프)로 바퀴가 빠지지 않게 넘어가거나 조향으로 회피하세요.',
+    preventionTip: '전방 노면 상태를 항상 10m 앞에서 살피고, 젖은 배수구 덮개는 미끄러우므로 속도를 줄여 비켜가세요.',
+    counterplayHint: '전방 노면을 살피고 S키로 감속한 뒤 안전한 옆 공간으로 피해가세요.',
   },
   roadwork: {
     type: 'roadwork',
@@ -39,7 +39,7 @@ export const SAFETY_LESSONS: Record<HazardType, SafetyLesson> = {
     shortTag: '공사 차로 점유',
     dangerReason: '자전거 도로가 막혀 급하게 차도로 진입하면 뒤따르던 차량과 추돌할 수 있습니다.',
     preventionTip: '전방 장애물 발견 시 미리 감속하고 뒤를 확인한 뒤 안전하게 차로를 변경하세요.',
-    counterplayHint: '안전 콘이 보이면 빠르게 경로를 변경하거나 속도를 줄이세요.',
+    counterplayHint: '안전 콘이 보이면 속도를 줄이고 미리 경로를 변경하세요.',
   },
   scooter: {
     type: 'scooter',
@@ -71,7 +71,7 @@ export const SAFETY_LESSONS: Record<HazardType, SafetyLesson> = {
     shortTag: '반려동물 돌진',
     dangerReason: '산책 중인 강아지가 목줄이 풀리거나 갑자기 차도 쪽으로 뛰어들어 자전거와 충돌하는 사고가 빈번합니다.',
     preventionTip: '인도 근처에 반려동물이 보이면 즉시 속도를 줄이고 충분한 거리를 두고 지나가세요.',
-    counterplayHint: '강아지가 튀어나오면 S키(감속) 또는 E키(경적)로 멈추게 하고 피해가세요.',
+    counterplayHint: '강아지가 튀어나오면 S키(감속) 또는 E/Space(경적)로 멈추게 하고 피해가세요.',
   },
   kids: {
     type: 'kids',
@@ -79,7 +79,7 @@ export const SAFETY_LESSONS: Record<HazardType, SafetyLesson> = {
     shortTag: '어린이 보행 주의',
     dangerReason: '어린이들은 주변을 살피지 않고 갑자기 뛰거나 방향을 바꾸므로 스쿨존에서는 각별한 주의가 필요합니다.',
     preventionTip: '스쿨존이나 어린이 주변에서는 보행자 속도에 맞춰 서행하고, 앞지르기 전 미리 벨을 울리세요.',
-    counterplayHint: 'E키(경적)로 미리 알리고 속도를 줄여 안전 거리를 확보하세요.',
+    counterplayHint: 'E/Space(경적)로 미리 알리고 속도를 줄여 안전 거리를 확보하세요.',
   },
   wrong_way_bike: {
     type: 'wrong_way_bike',
@@ -95,7 +95,7 @@ export const SAFETY_LESSONS: Record<HazardType, SafetyLesson> = {
     shortTag: '물웅덩이 미끄럼',
     dangerReason: '물웅덩이를 빠르게 지나가면 타이어가 미끄러지고, 물속에 숨어 있는 깊은 패임이나 맨홀에 빠질 수 있습니다.',
     preventionTip: '물웅덩이나 젖은 노면 앞에서는 급제동·급회전을 피하고 미리 피해가거나 감속하세요.',
-    counterplayHint: 'Space(점프)로 뛰어넘거나 조향으로 웅덩이를 비켜가세요.',
+    counterplayHint: '물웅덩이가 보이면 S키로 속도를 줄이고 조향으로 비켜가세요.',
   },
   gravel: {
     type: 'gravel',
@@ -103,7 +103,7 @@ export const SAFETY_LESSONS: Record<HazardType, SafetyLesson> = {
     shortTag: '자갈 · 돌맹이',
     dangerReason: '모래나 자갈, 돌맹이를 밟으면 얇은 자전거 타이어가 헛돌아 넘어지거나 타이어 펑크가 발생할 수 있습니다.',
     preventionTip: '커브길이나 갓길에 모래·자갈이 보이면 코너링 각도를 줄이고 사전에 회피하세요.',
-    counterplayHint: '돌맹이 구간이 보이면 Space(점프)로 넘거나 조향으로 피하세요.',
+    counterplayHint: '돌맹이·자갈 구간 앞에서는 S키로 감속하고 안전하게 피해가세요.',
   },
 };
 

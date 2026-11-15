@@ -16,6 +16,63 @@ function finalizeColorTexture(
   return tex;
 }
 
+function finalizeDataTexture(
+  canvas: HTMLCanvasElement,
+  maxAnisotropy: number,
+  repeatX = 1,
+  repeatY = 1
+): THREE.CanvasTexture {
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.anisotropy = maxAnisotropy;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(repeatX, repeatY);
+  tex.needsUpdate = true;
+  return tex;
+}
+
+function heightCanvasToNormalCanvas(heightCanvas: HTMLCanvasElement, strength = 2.2): HTMLCanvasElement {
+  const w = heightCanvas.width;
+  const h = heightCanvas.height;
+  const srcCtx = heightCanvas.getContext('2d')!;
+  const src = srcCtx.getImageData(0, 0, w, h).data;
+
+  const outCanvas = document.createElement('canvas');
+  outCanvas.width = w;
+  outCanvas.height = h;
+  const outCtx = outCanvas.getContext('2d')!;
+  const outImg = outCtx.createImageData(w, h);
+  const dst = outImg.data;
+
+  const sample = (x: number, y: number): number => {
+    const wx = ((x % w) + w) % w;
+    const wy = ((y % h) + h) % h;
+    return src[(wy * w + wx) * 4] / 255;
+  };
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const hL = sample(x - 1, y);
+      const hR = sample(x + 1, y);
+      const hU = sample(x, y - 1);
+      const hD = sample(x, y + 1);
+      const dx = (hL - hR) * strength;
+      const dy = (hU - hD) * strength;
+      const dz = 1.0;
+      const len = Math.hypot(dx, dy, dz) || 1;
+
+      const idx = (y * w + x) * 4;
+      dst[idx] = Math.round(((dx / len) * 0.5 + 0.5) * 255);
+      dst[idx + 1] = Math.round(((dy / len) * 0.5 + 0.5) * 255);
+      dst[idx + 2] = Math.round(((dz / len) * 0.5 + 0.5) * 255);
+      dst[idx + 3] = 255;
+    }
+  }
+  outCtx.putImageData(outImg, 0, 0);
+  return outCanvas;
+}
+
 export function createRoadTexture(maxAnisotropy: number, withCrosswalk = false): THREE.CanvasTexture {
   const w = 1024;
   const h = 1024;
@@ -59,7 +116,7 @@ export function createRoadTexture(maxAnisotropy: number, withCrosswalk = false):
   ctx.fillStyle = '#e2e8f0';
   ctx.fillRect(28, 0, 14, h);
 
-  // Yellow center divider (double yellow or solid-dashed) separating oncoming/left lane
+  // Yellow center divider (double yellow) separating oncoming/left lane
   ctx.fillStyle = '#eab308';
   ctx.fillRect(364, 0, 12, h);
   ctx.fillRect(386, 0, 12, h);
@@ -72,7 +129,7 @@ export function createRoadTexture(maxAnisotropy: number, withCrosswalk = false):
   ctx.fillStyle = '#e2e8f0';
   ctx.fillRect(968, 0, 14, h);
 
-  // Dashed lane divider between lane 1 and lane 2 (not used since 2 lanes + bike lane, let's put dashed white at x=548)
+  // Dashed lane divider
   ctx.fillStyle = '#e2e8f0';
   for (let y = 32; y < h; y += 160) {
     ctx.fillRect(546, y, 10, 84);
@@ -118,7 +175,7 @@ export function createRoadTexture(maxAnisotropy: number, withCrosswalk = false):
   ctx.restore();
 
   if (withCrosswalk) {
-    // Stop line before crosswalk (near bottom of tile, since player rides toward -Z)
+    // Stop line before crosswalk
     ctx.fillStyle = '#f8fafc';
     ctx.fillRect(46, 760, 916, 22);
 
@@ -128,7 +185,7 @@ export function createRoadTexture(maxAnisotropy: number, withCrosswalk = false):
       ctx.fillRect(x, 420, 42, 280);
     }
 
-    // Korean "정지" or yellow school zone slow diamond ahead of crosswalk
+    // Yellow school zone slow diamond ahead of crosswalk
     ctx.save();
     ctx.translate(546, 895);
     ctx.strokeStyle = '#facc15';
@@ -141,9 +198,105 @@ export function createRoadTexture(maxAnisotropy: number, withCrosswalk = false):
     ctx.closePath();
     ctx.stroke();
     ctx.restore();
+
+    // Korean school-zone 30 speed limit circle on bike-adjacent vehicle lane
+    ctx.save();
+    ctx.translate(546, 200);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
+    ctx.beginPath();
+    ctx.arc(0, 0, 58, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#dc2626';
+    ctx.lineWidth = 12;
+    ctx.beginPath();
+    ctx.arc(0, 0, 52, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = '#0f172a';
+    ctx.font = 'bold 50px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('30', 0, 3);
+    ctx.restore();
   }
 
   return finalizeColorTexture(canvas, maxAnisotropy, 1, 1);
+}
+
+export function createRoadNormalMap(maxAnisotropy: number): THREE.CanvasTexture {
+  const size = 256;
+  const hCanvas = document.createElement('canvas');
+  hCanvas.width = size;
+  hCanvas.height = size;
+  const ctx = hCanvas.getContext('2d')!;
+
+  ctx.fillStyle = '#808080';
+  ctx.fillRect(0, 0, size, size);
+
+  // Micro asphalt aggregate relief
+  for (let i = 0; i < 6500; i++) {
+    const x = Math.random() * size;
+    const y = Math.random() * size;
+    const v = 104 + Math.floor(Math.random() * 52);
+    ctx.fillStyle = `rgb(${v},${v},${v})`;
+    ctx.fillRect(x, y, 2, 2);
+  }
+
+  // Subtle longitudinal tire grooves
+  ctx.fillStyle = 'rgba(92, 92, 92, 0.35)';
+  ctx.fillRect(36, 0, 14, size);
+  ctx.fillRect(72, 0, 14, size);
+  ctx.fillRect(114, 0, 14, size);
+  ctx.fillRect(150, 0, 14, size);
+
+  // Raised road paint strips
+  ctx.fillStyle = '#9e9e9e';
+  ctx.fillRect(91, 0, 3, size);
+  ctx.fillRect(96, 0, 3, size);
+  ctx.fillRect(178, 0, 4, size);
+  ctx.fillRect(242, 0, 4, size);
+
+  const normalCanvas = heightCanvasToNormalCanvas(hCanvas, 2.0);
+  return finalizeDataTexture(normalCanvas, maxAnisotropy, 1, 2);
+}
+
+export function createRoadRoughnessMap(maxAnisotropy: number): THREE.CanvasTexture {
+  const size = 256;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d')!;
+
+  // Base coarse asphalt roughness (~0.86)
+  ctx.fillStyle = '#dbdbdb';
+  ctx.fillRect(0, 0, size, size);
+
+  // Micro aggregate roughness speckles
+  for (let i = 0; i < 4000; i++) {
+    const x = Math.random() * size;
+    const y = Math.random() * size;
+    const v = 200 + Math.floor(Math.random() * 45);
+    ctx.fillStyle = `rgb(${v},${v},${v})`;
+    ctx.fillRect(x, y, 2, 2);
+  }
+
+  // Polished tire tracks (slightly glossier under sun reflection)
+  ctx.fillStyle = 'rgba(176, 176, 176, 0.45)';
+  ctx.fillRect(35, 0, 14, size);
+  ctx.fillRect(70, 0, 14, size);
+  ctx.fillRect(112, 0, 14, size);
+  ctx.fillRect(148, 0, 14, size);
+
+  // Red bike lane urethane surface (smoother specular response)
+  ctx.fillStyle = '#b4b4b4';
+  ctx.fillRect(181, 0, 61, size);
+
+  // Painted markings (glossier)
+  ctx.fillStyle = '#9a9a9a';
+  ctx.fillRect(91, 0, 3, size);
+  ctx.fillRect(96, 0, 3, size);
+  ctx.fillRect(178, 0, 4, size);
+
+  return finalizeDataTexture(canvas, maxAnisotropy, 1, 2);
 }
 
 export function createSidewalkTexture(maxAnisotropy: number): THREE.CanvasTexture {
@@ -193,6 +346,43 @@ export function createSidewalkTexture(maxAnisotropy: number): THREE.CanvasTextur
   }
 
   return finalizeColorTexture(canvas, maxAnisotropy, 1, 3);
+}
+
+export function createSidewalkNormalMap(maxAnisotropy: number): THREE.CanvasTexture {
+  const size = 256;
+  const hCanvas = document.createElement('canvas');
+  hCanvas.width = size;
+  hCanvas.height = size;
+  const ctx = hCanvas.getContext('2d')!;
+
+  ctx.fillStyle = '#969696';
+  ctx.fillRect(0, 0, size, size);
+
+  // Tile grout lines recessed
+  ctx.strokeStyle = '#505050';
+  ctx.lineWidth = 3;
+  const step = 32;
+  for (let x = 0; x <= size; x += step) {
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, size);
+    ctx.stroke();
+  }
+  for (let y = 0; y <= size; y += step) {
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(size, y);
+    ctx.stroke();
+  }
+
+  // Raised tactile guide bumps near curb
+  ctx.fillStyle = '#cfcfcf';
+  for (let y = 4; y < size; y += 12) {
+    ctx.fillRect(27, y, 11, 5);
+  }
+
+  const normalCanvas = heightCanvasToNormalCanvas(hCanvas, 2.4);
+  return finalizeDataTexture(normalCanvas, maxAnisotropy, 1, 3);
 }
 
 export function createBuildingFacadeTexture(
