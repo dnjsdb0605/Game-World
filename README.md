@@ -1,11 +1,64 @@
-<div align="center">
+# 라이딩 세이프 (Riding Safe 3D)
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+학생들이 **GTA 스타일의 3인칭 자전거 주행 시점**에서 실제 도로 위 다양한 위험 상황을 간접 체험하고, 방어 운전을 통해 안전하게 회피하는 **3D 자전거 안전 교육 게임**입니다.
 
-  <h1>Built with AI Studio</h2>
+## 주요 기능
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+- **3인칭 추격 카메라 & 자전거 물리**: 속도별 동적 시야각(FOV), 좌우 조향 카운터 린(Lean), 점프, 브레이크 제동 및 미끄러짐 물리 구현
+- **13가지 실제 도로 위험 상황과 예고(Telegraph) 시스템**:
+  - **개문 사고**: 갓길 주차 차량 비상등 점멸 후 운전석 문 열림
+  - **사각지대 교차로 차량**: 골목길에서 경고 화살표·헤드라이트 후 차량 진입
+  - **스몸비 보행자**: 스마트폰을 보며 차도로 들어오는 보행자 (경적 `E` 대응)
+  - **애완동물 돌진**: 인도에서 갑자기 뛰어나오는 강아지 (감속·경적 대응)
+  - **어린이 보행자**: 스쿨존 주변 예측 불허 어린이 이동 (서행·경적 대응)
+  - **역주행 자전거**: 자전거 도로 정면에서 마주 오는 역주행 자전거
+  - **물웅덩이**: 밟을 시 수막현상 미끄러짐 (`Space` 점프 또는 조향 회피)
+  - **돌맹이 · 자갈**: 밟을 시 핸들 흔들림 (`Space` 점프 또는 조향 회피)
+  - **포트홀 · 배수구 덮개** & **공사 구간 라바콘**
+  - **급정거 배달 오토바이** & **적색 신호 · 정지선 준수**
+  - **차도 주행 차량 및 중앙선 침범 위험**
+- **콤보 & 안전 보상 시스템**: 아슬아슬 회피, 경적 방어운전, 정지선 준수 보너스, 안전모 보호막 및 전조등 점수 2배 아이템
+- **주행 결과 사고 예방 리포트**: 주행 종료 시 안전 운전 등급(`S/A/B/C`)과 함께 실제 충돌하거나 마주친 위험 요소별 원인 및 예방 수칙 제공
+- **절차적 Web Audio 사운드**: 외부 음원 파일 없이 타이어 구름음, 금속 자전거 벨, 브레이크 마찰음, 차량 경적 등을 실시간 합성
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+## 조작 방법
 
-</div>
+| 동작 | 키보드 |
+| --- | --- |
+| 좌/우 조향 | `A` / `D` 또는 `←` / `→` |
+| 가속 / 브레이크 | `W` / `S` 또는 `↑` / `↓` |
+| 점프 (물웅덩이·배수구·돌맹이 회피) | `Space` |
+| 경적 / 벨 (보행자·어린이·반려동물 알림) | `E` 또는 `Shift` |
+| 일시정지 | `Esc` 또는 `P` |
+
+> 모바일 및 태블릿 환경에서는 화면 하단 터치 버튼을 지원합니다.
+
+## 로컬 실행 및 빌드
+
+```bash
+# 1. 의존성 설치
+npm install
+
+# 2. 개발 서버 실행 (http://localhost:3000)
+npm run dev
+
+# 3. 타입 검사 및 프로덕션 빌드
+npm run lint
+npm run build
+```
+
+## GitHub 업로드 및 GitHub Pages 자동 배포
+
+1. GitHub에서 새 저장소(Repository)를 생성합니다.
+2. 프로젝트 루트에서 아래 명령어로 코드를 푸시합니다.
+
+```bash
+git init
+git add .
+git commit -m "feat: 3D bicycle safety game"
+git branch -M main
+git remote add origin https://github.com/<사용자아이디>/<저장소이름>.git
+git push -u origin main
+```
+
+3. `.github/workflows/deploy.yml`이 포함되어 있어 GitHub 저장소의 **Settings → Pages → Source**를 **GitHub Actions**로 선택하면 `main` 브랜치 푸시 시 자동으로 빌드 및 배포됩니다.

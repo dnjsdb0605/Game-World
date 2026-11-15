@@ -1,0 +1,2042 @@
+import * as THREE from 'three';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { soundEngine } from './audio';
+import {
+  createCarRig,
+  createDogRig,
+  createGravelGroup,
+  createKidsGroup,
+  createPedestrianRig,
+  createPickupGroup,
+  createPlayerBikeRig,
+  createRoadworkGroup,
+  createScooterRig,
+  createSignalGantry,
+  createTreeGroup,
+  createWrongWayBikeRig,
+  type CarRig,
+  type DogRig,
+  type KidsRig,
+  type PedestrianRig,
+  type PlayerBikeRig,
+  type ScooterRig,
+  type SignalGantryRig,
+  type WrongWayBikeRig,
+} from './models';
+import {
+  createBuildingFacadeTexture,
+  createContactShadowTexture,
+  createPotholeTexture,
+  createPuddleTexture,
+  createRoadTexture,
+  createSidewalkTexture,
+  createWarningChevronTexture,
+} from './textures';
+import type {
+  CalloutEvent,
+  DifficultyMode,
+  GamePhase,
+  HazardType,
+  HudSnapshot,
+  MobileInputState,
+  RunSummary,
+} from './types';
+
+// Pre-allocated math helpers outside the render loop (zero GC churn)
+const _vec3A = new THREE.Vector3();
+const _vec3B = new THREE.Vector3();
+
+const SEGMENT_LEN = 36;
+const NUM_SEGMENTS = 5;
+const TOTAL_ROAD_LEN = SEGMENT_LEN * NUM_SEGMENTS;
+const ROAD_HALF_WIDTH = 4.25;
+
+interface RoadSegment {
+  group: THREE.Group;
+  z: number;
+  hasCrosswalk: boolean;
+}
+
+interface ActiveHazard {
+  id: number;
+  type: HazardType;
+  group: THREE.Group;
+  x: number;
+  z: number;
+  width: number;
+  depth: number;
+  height: number;
+  passed: boolean;
+  hit: boolean;
+  nearMissAwarded: boolean;
+  defensiveAwarded: boolean;
+  // Type-specific runtime state
+  carRig?: CarRig;
+  pedRig?: PedestrianRig;
+  scooterRig?: ScooterRig;
+  signalRig?: SignalGantryRig;
+  dogRig?: DogRig;
+  kidsRig?: KidsRig;
+  wrongBikeRig?: WrongWayBikeRig;
+  warningMesh?: THREE.Mesh;
+  doorOpenProgress: number;
+  sideDir: number; // -1 or +1
+  startX: number;
+  targetX: number;
+  alertedByBell: boolean;
+  forwardSpeed: number;
+  braking: boolean;
+  signalState: 'green' | 'yellow' | 'red';
+  walkPhase: number;
+}
+
+interface ActivePickup {
+  kind: 'shield' | 'double' | 'star';
+  group: THREE.Group;
+  x: number;
+  z: number;
+  collected: boolean;
+}
+
+interface Particle {
+  mesh: THREE.Mesh;
+  vx: number;
+  vy: number;
+  vz: number;
+  life: number;
+  maxLife: number;
+}
+
+export interface EngineCallbacks {
+  onHudUpdate: (snapshot: HudSnapshot) => void;
+  onGameOver: (summary: RunSummary) => void;
+  onPhaseChange: (phase: GamePhase) => void;
+  onCrashFlash: () => void;
+}
+
+export class BikeSafetyEngine {
+  private container: HTMLElement;
+  private callbacks: EngineCallbacks;
+  private renderer!: THREE.WebGLRenderer;
+  private scene!: THREE.Scene;
+  private camera!: THREE.PerspectiveCamera;
+  private sunLight!: THREE.DirectionalLight;
+  private isSoftwareGl = false;
+
+  private frameId = 0;
+  private disposed = false;
+  private lastTime = 0;
+  private elapsed = 0;
+
+  // Textures & shared resources
+  private contactShadowTex!: THREE.CanvasTexture;
+  private potholeTex!: THREE.CanvasTexture;
+  private puddleTex!: THREE.CanvasTexture;
+  private chevronTex!: THREE.CanvasTexture;
+  private roadTextures: THREE.CanvasTexture[] = [];
+  private buildingTextures: THREE.CanvasTexture[] = [];
+
+  // World & Player
+  private bikeRig!: PlayerBikeRig;
+  private segments: RoadSegment[] = [];
+  private hazards: ActiveHazard[] = [];
+  private pickups: ActivePickup[] = [];
+  private particles: Particle[] = [];
+  private bellRingMesh!: THREE.Mesh;
+  private bellRingLife = 0;
+
+  // Game State
+  private phase: GamePhase = 'title';
+  private mode: DifficultyMode = 'city';
+  private playerX = 3.2; // Start in the red Korean bike lane
+  private playerVX = 0;
+  private playerY = 0;
+  private playerVY = 0;
+  private grounded = true;
+  private speed = 10.5; // m/s (~38 km/h max, cruising ~22-30 km/h)
+  private wheelAngle = 0;
+  private crankAngle = 0;
+  private leanAngle = 0;
+  private steerVisual = 0;
+
+  private distanceM = 0;
+  private score = 0;
+  private bestScores: Record<DifficultyMode, number> = {
+    school: 0,
+    city: 0,
+    endless: 0,
+  };
+  private combo = 0;
+  private maxCombo = 0;
+  private hearts = 3;
+  private readonly maxHearts = 3;
+  private hasShield = false;
+  private doubleScoreTimer = 0;
+  private invulnTimer = 0;
+  private hitstopTimer = 0;
+  private shakeIntensity = 0;
+
+  private bellCooldown = 0;
+  private readonly bellCooldownMax = 1.2;
+  private jumpBufferTimer = 0;
+  private coyoteTimer = 0;
+  private slipTimer = 0;
+  private wrongLaneTimer = 0;
+
+  private nextSpawnZ = -48;
+  private nextTrafficZ = -32;
+  private hazardBag: HazardType[] = [];
+  private hazardIdSeq = 1;
+  private calloutIdSeq = 1;
+  private activeCallout: CalloutEvent | null = null;
+  private calloutTimer = 0;
+  private activeWarning: string | null = null;
+  private warningTimer = 0;
+
+  private nearMissCount = 0;
+  private defensiveCount = 0;
+  private lastFatalHazard: HazardType | null = null;
+  private hitCounts: Record<HazardType, number> = this.emptyCounts();
+  private encounterCounts: Record<HazardType, number> = this.emptyCounts();
+  private lastHudPush = 0;
+
+  // Camera state
+  private camPos = new THREE.Vector3(3.2, 2.5, 4.8);
+  private camLook = new THREE.Vector3(3.2, 1.0, -8);
+
+  // Input state (separated held vs edge-triggered)
+  private heldKeys = new Set<string>();
+  private mobileInput: MobileInputState = { left: false, right: false, accel: false, brake: false };
+  private brakeSoundCooldown = 0;
+
+  constructor(container: HTMLElement, callbacks: EngineCallbacks) {
+    this.container = container;
+    this.callbacks = callbacks;
+    this.loadBestScores();
+    this.initThree();
+    this.buildEnvironment();
+    this.buildPlayer();
+    this.buildParticles();
+    this.bindEvents();
+
+    if (!this.isSoftwareGl) {
+      this.renderer.compile(this.scene, this.camera);
+    }
+
+    this.lastTime = performance.now();
+    this.loop(this.lastTime);
+  }
+
+  private emptyCounts(): Record<HazardType, number> {
+    return {
+      dooring: 0,
+      blind_car: 0,
+      smombie: 0,
+      pothole: 0,
+      roadwork: 0,
+      scooter: 0,
+      red_signal: 0,
+      traffic_car: 0,
+      pet: 0,
+      kids: 0,
+      wrong_way_bike: 0,
+      puddle: 0,
+      gravel: 0,
+    };
+  }
+
+  private loadBestScores(): void {
+    try {
+      const raw = localStorage.getItem('riding_safe_best_v1');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        this.bestScores = { ...this.bestScores, ...parsed };
+      }
+    } catch {
+      // ignore storage errors
+    }
+  }
+
+  private saveBestScore(mode: DifficultyMode, score: number): number {
+    if (score > this.bestScores[mode]) {
+      this.bestScores[mode] = score;
+      try {
+        localStorage.setItem('riding_safe_best_v1', JSON.stringify(this.bestScores));
+      } catch {
+        // ignore
+      }
+    }
+    return this.bestScores[mode];
+  }
+
+  private detectSoftwareGl(): boolean {
+    try {
+      const probe = document.createElement('canvas');
+      const gl = probe.getContext('webgl2');
+      if (!gl) return true;
+      const ext = gl.getExtension('WEBGL_debug_renderer_info');
+      const param = ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER;
+      const gpu = String(gl.getParameter(param));
+      gl.getExtension('WEBGL_lose_context')?.loseContext();
+      return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
+    } catch {
+      return true;
+    }
+  }
+
+  private initThree(): void {
+    this.isSoftwareGl = this.detectSoftwareGl();
+
+    const width = Math.max(1, this.container.clientWidth);
+    const height = Math.max(1, this.container.clientHeight);
+
+    this.renderer = new THREE.WebGLRenderer({
+      antialias: !this.isSoftwareGl,
+      powerPreference: 'high-performance',
+    });
+    this.renderer.setSize(width, height);
+    this.renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.08;
+    this.renderer.shadowMap.enabled = !this.isSoftwareGl;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.domElement.style.display = 'block';
+    this.renderer.domElement.style.width = '100%';
+    this.renderer.domElement.style.height = '100%';
+    this.container.appendChild(this.renderer.domElement);
+
+    this.scene = new THREE.Scene();
+    const skyColor = new THREE.Color(0xcce2f8);
+    this.scene.background = skyColor;
+    this.scene.fog = new THREE.Fog(skyColor, 48, 138);
+
+    const pmrem = new THREE.PMREMGenerator(this.renderer);
+    this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    pmrem.dispose();
+
+    this.camera = new THREE.PerspectiveCamera(64, width / height, 0.1, 180);
+    this.camera.position.copy(this.camPos);
+    this.camera.lookAt(this.camLook);
+
+    // Warm sunlit key + cool sky/ground hemisphere + subtle rim light
+    const hemi = new THREE.HemisphereLight(0xdbeafe, 0x64748b, 0.85);
+    this.scene.add(hemi);
+
+    this.sunLight = new THREE.DirectionalLight(0xfff1d6, 1.85);
+    this.sunLight.position.set(16, 28, 14);
+    this.sunLight.castShadow = !this.isSoftwareGl;
+    this.sunLight.shadow.mapSize.width = 1024;
+    this.sunLight.shadow.mapSize.height = 1024;
+    this.sunLight.shadow.camera.near = 2;
+    this.sunLight.shadow.camera.far = 90;
+    const d = 26;
+    this.sunLight.shadow.camera.left = -d;
+    this.sunLight.shadow.camera.right = d;
+    this.sunLight.shadow.camera.top = d;
+    this.sunLight.shadow.camera.bottom = -d;
+    this.sunLight.shadow.bias = -0.0005;
+    this.sunLight.shadow.normalBias = 0.02;
+    this.scene.add(this.sunLight);
+    this.scene.add(this.sunLight.target);
+
+    const rimLight = new THREE.DirectionalLight(0xbae6fd, 0.55);
+    rimLight.position.set(-14, 12, -20);
+    this.scene.add(rimLight);
+
+    const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
+    this.contactShadowTex = createContactShadowTexture();
+    this.potholeTex = createPotholeTexture(maxAniso);
+    this.puddleTex = createPuddleTexture(maxAniso);
+    this.chevronTex = createWarningChevronTexture(maxAniso);
+    this.roadTextures = [
+      createRoadTexture(maxAniso, false),
+      createRoadTexture(maxAniso, true),
+    ];
+    for (let i = 0; i < 4; i++) {
+      this.buildingTextures.push(createBuildingFacadeTexture(maxAniso, i));
+    }
+  }
+
+  private buildEnvironment(): void {
+    const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
+    const sidewalkTex = createSidewalkTexture(maxAniso);
+
+    // Wide ground plane extending out to horizon so world is never boxed in a void
+    const groundMat = new THREE.MeshStandardMaterial({ color: 0x6b7f5e, roughness: 0.95 });
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(320, 320), groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.set(0, 0, -40);
+    ground.receiveShadow = true;
+    this.scene.add(ground);
+
+    const roadMatNormal = new THREE.MeshStandardMaterial({
+      map: this.roadTextures[0],
+      roughness: 0.85,
+      metalness: 0.04,
+    });
+    const roadMatCross = new THREE.MeshStandardMaterial({
+      map: this.roadTextures[1],
+      roughness: 0.85,
+      metalness: 0.04,
+    });
+    const sidewalkMat = new THREE.MeshStandardMaterial({
+      map: sidewalkTex,
+      roughness: 0.88,
+      metalness: 0.02,
+    });
+    const curbMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, roughness: 0.8 });
+    const poleMat = new THREE.MeshStandardMaterial({ color: 0x475569, metalness: 0.6, roughness: 0.35 });
+    const lampMat = new THREE.MeshStandardMaterial({ color: 0xfef3c7, emissive: 0xfde68a, emissiveIntensity: 0.6 });
+
+    for (let i = 0; i < NUM_SEGMENTS; i++) {
+      const segGroup = new THREE.Group();
+      const hasCrosswalk = i % 3 === 1;
+      const zPos = 18 - i * SEGMENT_LEN;
+      segGroup.position.z = zPos;
+
+      // Asphalt surface elevated by 0.02m above base ground
+      const roadMesh = new THREE.Mesh(
+        new THREE.PlaneGeometry(10.4, SEGMENT_LEN),
+        hasCrosswalk ? roadMatCross : roadMatNormal
+      );
+      roadMesh.rotation.x = -Math.PI / 2;
+      roadMesh.position.y = 0.025;
+      roadMesh.receiveShadow = true;
+      segGroup.add(roadMesh);
+
+      // Left & Right sidewalks (raised curb at y=0.14)
+      [-8.4, 8.4].forEach((sx) => {
+        const sw = new THREE.Mesh(new THREE.BoxGeometry(6.4, 0.14, SEGMENT_LEN), sidewalkMat);
+        sw.position.set(sx, 0.07, 0);
+        sw.receiveShadow = true;
+        segGroup.add(sw);
+
+        const curbX = sx > 0 ? 5.25 : -5.25;
+        const curb = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.17, SEGMENT_LEN), curbMat);
+        curb.position.set(curbX, 0.085, 0);
+        segGroup.add(curb);
+      });
+
+      // Roadside trees & streetlights
+      for (let t = -1; t <= 1; t += 2) {
+        const localZ = t * 9;
+        [-6.6, 6.6].forEach((tx, sideIdx) => {
+          if ((i + sideIdx + (t > 0 ? 1 : 0)) % 2 === 0) {
+            const tree = createTreeGroup();
+            tree.position.set(tx, 0.14, localZ);
+            const scale = 0.88 + ((i * 7 + sideIdx * 3) % 5) * 0.06;
+            tree.scale.setScalar(scale);
+            segGroup.add(tree);
+          } else {
+            const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.11, 4.8, 8), poleMat);
+            pole.position.set(tx > 0 ? 5.75 : -5.75, 2.54, localZ);
+            pole.castShadow = true;
+            segGroup.add(pole);
+
+            const arm = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.09, 0.09), poleMat);
+            arm.position.set(tx > 0 ? 5.25 : -5.25, 4.9, localZ);
+            segGroup.add(arm);
+
+            const lamp = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.08, 0.2), lampMat);
+            lamp.position.set(tx > 0 ? 4.8 : -4.8, 4.85, localZ);
+            segGroup.add(lamp);
+          }
+        });
+      }
+
+      // Urban Korean buildings along outer edges (leave alley gaps on crosswalk segments!)
+      const bPositions = hasCrosswalk ? [-11, 11] : [-12, 0, 12];
+      bPositions.forEach((bz, bIdx) => {
+        [-15.2, 15.2].forEach((bx, sideIdx) => {
+          const texIdx = (i + bIdx + sideIdx) % this.buildingTextures.length;
+          const height = 9 + ((i * 3 + bIdx * 5 + sideIdx) % 4) * 3.2;
+          const bMat = new THREE.MeshStandardMaterial({
+            map: this.buildingTextures[texIdx],
+            roughness: 0.78,
+            metalness: 0.06,
+          });
+          const roofMat = new THREE.MeshStandardMaterial({ color: 0x64748b, roughness: 0.9 });
+          const building = new THREE.Mesh(
+            new THREE.BoxGeometry(7.2, height, 10.2),
+            [bMat, bMat, roofMat, roofMat, bMat, bMat]
+          );
+          building.position.set(bx, height / 2 + 0.12, bz);
+          building.castShadow = true;
+          building.receiveShadow = true;
+          segGroup.add(building);
+        });
+      });
+
+      this.scene.add(segGroup);
+      this.segments.push({ group: segGroup, z: zPos, hasCrosswalk });
+    }
+  }
+
+  private buildPlayer(): void {
+    this.bikeRig = createPlayerBikeRig(this.contactShadowTex);
+    this.bikeRig.root.position.set(this.playerX, 0, 0);
+    this.scene.add(this.bikeRig.root);
+
+    // Expanding Bell Soundwave Torus
+    this.bellRingMesh = new THREE.Mesh(
+      new THREE.RingGeometry(0.7, 0.95, 32),
+      new THREE.MeshBasicMaterial({
+        color: 0x38bdf8,
+        transparent: true,
+        opacity: 0,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      })
+    );
+    this.bellRingMesh.rotation.x = -Math.PI / 2;
+    this.bellRingMesh.position.set(this.playerX, 0.35, -0.5);
+    this.bellRingMesh.visible = false;
+    this.scene.add(this.bellRingMesh);
+  }
+
+  private buildParticles(): void {
+    const geo = new THREE.BoxGeometry(0.12, 0.12, 0.12);
+    for (let i = 0; i < 42; i++) {
+      const mat = new THREE.MeshBasicMaterial({ color: 0xfacc15, transparent: true, opacity: 1 });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.visible = false;
+      this.scene.add(mesh);
+      this.particles.push({ mesh, vx: 0, vy: 0, vz: 0, life: 0, maxLife: 0.4 });
+    }
+  }
+
+  private spawnBurst(x: number, y: number, z: number, colorHex: number, count: number, spread = 4.5): void {
+    let spawned = 0;
+    for (let i = 0; i < this.particles.length && spawned < count; i++) {
+      const p = this.particles[i];
+      if (p.life <= 0) {
+        p.mesh.visible = true;
+        p.mesh.position.set(x, y, z);
+        (p.mesh.material as THREE.MeshBasicMaterial).color.setHex(colorHex);
+        (p.mesh.material as THREE.MeshBasicMaterial).opacity = 1;
+        p.vx = (Math.random() - 0.5) * spread;
+        p.vy = 1.5 + Math.random() * spread * 0.9;
+        p.vz = (Math.random() - 0.5) * spread;
+        p.maxLife = 0.35 + Math.random() * 0.25;
+        p.life = p.maxLife;
+        spawned++;
+      }
+    }
+  }
+
+  private bindEvents(): void {
+    window.addEventListener('resize', this.handleResize);
+    window.addEventListener('keydown', this.handleKeyDown);
+    window.addEventListener('keyup', this.handleKeyUp);
+    window.addEventListener('blur', this.handleBlur);
+  }
+
+  private handleResize = (): void => {
+    if (this.disposed) return;
+    const width = Math.max(1, this.container.clientWidth);
+    const height = Math.max(1, this.container.clientHeight);
+    this.camera.aspect = width / height;
+    this.camera.updateProjectionMatrix();
+    this.renderer.setSize(width, height);
+    this.renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
+  };
+
+  private handleBlur = (): void => {
+    this.heldKeys.clear();
+    this.mobileInput = { left: false, right: false, accel: false, brake: false };
+  };
+
+  private handleKeyDown = (e: KeyboardEvent): void => {
+    const code = e.code;
+    if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(code)) {
+      e.preventDefault();
+    }
+
+    if (this.phase === 'title') {
+      if (code === 'Enter' || code === 'Space') {
+        this.startRun(this.mode);
+      }
+      return;
+    }
+
+    if (code === 'Escape' || code === 'KeyP') {
+      if (this.phase === 'playing') {
+        this.pause();
+        return;
+      }
+      if (this.phase === 'paused') {
+        this.resume();
+        return;
+      }
+    }
+
+    if (this.phase !== 'playing') return;
+
+    const wasHeld = this.heldKeys.has(code);
+    this.heldKeys.add(code);
+
+    // Edge-triggered actions
+    if (!wasHeld) {
+      if (code === 'Space') {
+        this.triggerJump();
+      } else if (code === 'KeyE' || code === 'ShiftLeft' || code === 'ShiftRight' || code === 'KeyF') {
+        this.triggerBell();
+      }
+    }
+  };
+
+  private handleKeyUp = (e: KeyboardEvent): void => {
+    this.heldKeys.delete(e.code);
+  };
+
+  // Public Controls for React UI / Touch
+  public setMobileInput(patch: Partial<MobileInputState>): void {
+    this.mobileInput = { ...this.mobileInput, ...patch };
+  }
+
+  public triggerJump(): void {
+    if (this.phase !== 'playing') return;
+    soundEngine.unlock();
+    this.jumpBufferTimer = 0.14;
+  }
+
+  public triggerBell(): void {
+    if (this.phase !== 'playing') return;
+    soundEngine.unlock();
+    if (this.bellCooldown > 0) return;
+
+    this.bellCooldown = this.bellCooldownMax;
+    this.bellRingLife = 0.55;
+    this.bellRingMesh.visible = true;
+    this.bellRingMesh.position.set(this.playerX, 0.35, -0.5);
+    this.bellRingMesh.scale.setScalar(1);
+    soundEngine.playBell();
+
+    // Check if any smombie, kids, or pet is within 32m ahead
+    let alertedAny = false;
+    for (const h of this.hazards) {
+      if (!h.alertedByBell && h.z < 1 && h.z > -34) {
+        if (h.type === 'smombie') {
+          h.alertedByBell = true;
+          h.targetX = 4.75;
+          if (h.pedRig) {
+            h.pedRig.alertMark.visible = true;
+            h.pedRig.phoneGlow.visible = false;
+          }
+          if (!h.defensiveAwarded) {
+            h.defensiveAwarded = true;
+            this.defensiveCount++;
+            this.awardBonus('경적 방어운전!', 150, 'good');
+          }
+          alertedAny = true;
+        } else if (h.type === 'kids') {
+          h.alertedByBell = true;
+          h.targetX = 4.85;
+          if (h.kidsRig) h.kidsRig.alertMark.visible = true;
+          if (!h.defensiveAwarded) {
+            h.defensiveAwarded = true;
+            this.defensiveCount++;
+            this.awardBonus('어린이 보호 경적!', 160, 'good');
+          }
+          alertedAny = true;
+        } else if (h.type === 'pet') {
+          h.alertedByBell = true;
+          h.targetX = 4.8;
+          if (h.dogRig) h.dogRig.alertMark.visible = true;
+          if (!h.defensiveAwarded) {
+            h.defensiveAwarded = true;
+            this.defensiveCount++;
+            this.awardBonus('반려동물 안전 대응!', 160, 'good');
+          }
+          alertedAny = true;
+        }
+      }
+    }
+    if (!alertedAny) {
+      this.pushCallout('따르릉~ 전방 주의 알림', 0, 'warn');
+    }
+  }
+
+  public setMode(mode: DifficultyMode): void {
+    this.mode = mode;
+  }
+
+  public startRun(mode: DifficultyMode): void {
+    soundEngine.unlock();
+    this.mode = mode;
+    this.clearEntities();
+
+    this.phase = 'playing';
+    this.callbacks.onPhaseChange('playing');
+
+    this.playerX = 3.2;
+    this.playerVX = 0;
+    this.playerY = 0;
+    this.playerVY = 0;
+    this.grounded = true;
+    this.speed = mode === 'school' ? 9.5 : 11.2;
+    this.distanceM = 0;
+    this.score = 0;
+    this.combo = 0;
+    this.maxCombo = 0;
+    this.hearts = this.maxHearts;
+    this.hasShield = false;
+    this.doubleScoreTimer = 0;
+    this.invulnTimer = 0;
+    this.hitstopTimer = 0;
+    this.shakeIntensity = 0;
+    this.bellCooldown = 0;
+    this.slipTimer = 0;
+    this.wrongLaneTimer = 0;
+    this.nextSpawnZ = -44;
+    this.nextTrafficZ = -34;
+    this.hazardBag = [];
+    this.activeCallout = null;
+    this.activeWarning = null;
+    this.nearMissCount = 0;
+    this.defensiveCount = 0;
+    this.lastFatalHazard = null;
+    this.hitCounts = this.emptyCounts();
+    this.encounterCounts = this.emptyCounts();
+    this.heldKeys.clear();
+
+    this.bikeRig.root.position.set(this.playerX, 0, 0);
+    this.bikeRig.root.visible = true;
+    this.bikeRig.shieldBubble.visible = false;
+
+    this.pushCallout(
+      mode === 'school'
+        ? '스쿨존 등굣길 주행 시작!'
+        : mode === 'city'
+        ? '도심 자전거 도로 안전 챌린지!'
+        : '무한 안전 라이딩 챌린지!',
+      0,
+      'good'
+    );
+    this.pushHud(true);
+  }
+
+  public pause(): void {
+    if (this.phase !== 'playing') return;
+    this.phase = 'paused';
+    this.heldKeys.clear();
+    soundEngine.updateRollingSound(0, true, false);
+    this.callbacks.onPhaseChange('paused');
+  }
+
+  public resume(): void {
+    if (this.phase !== 'paused') return;
+    this.phase = 'playing';
+    this.lastTime = performance.now();
+    this.callbacks.onPhaseChange('playing');
+  }
+
+  public returnToTitle(): void {
+    this.clearEntities();
+    this.phase = 'title';
+    this.playerX = 3.2;
+    this.playerY = 0;
+    this.speed = 9.2;
+    this.bikeRig.root.visible = true;
+    this.bikeRig.shieldBubble.visible = false;
+    soundEngine.updateRollingSound(0, true, false);
+    this.callbacks.onPhaseChange('title');
+  }
+
+  private clearEntities(): void {
+    for (const h of this.hazards) {
+      this.scene.remove(h.group);
+      if (h.warningMesh) this.scene.remove(h.warningMesh);
+    }
+    this.hazards = [];
+    for (const p of this.pickups) {
+      this.scene.remove(p.group);
+    }
+    this.pickups = [];
+  }
+
+  private getTargetDistance(): number | null {
+    if (this.mode === 'school') return 800;
+    if (this.mode === 'city') return 1500;
+    return null;
+  }
+
+  private getZoneInfo(): { index: number; name: string } {
+    if (this.distanceM < 400) return { index: 1, name: '1구간 · 주택가 골목' };
+    if (this.distanceM < 900) return { index: 2, name: '2구간 · 스쿨존 교차로' };
+    return { index: 3, name: '3구간 · 도심 간선도로' };
+  }
+
+  private awardBonus(label: string, basePts: number, tone: 'good' | 'warn' | 'danger'): void {
+    this.combo++;
+    if (this.combo > this.maxCombo) this.maxCombo = this.combo;
+    const mult = (1 + Math.min(this.combo - 1, 8) * 0.2) * (this.doubleScoreTimer > 0 ? 2 : 1);
+    const pts = Math.round(basePts * mult);
+    this.score += pts;
+    this.pushCallout(label, pts, tone);
+  }
+
+  private pushCallout(text: string, points: number, tone: 'good' | 'warn' | 'danger'): void {
+    this.activeCallout = {
+      id: this.calloutIdSeq++,
+      text,
+      points,
+      tone,
+    };
+    this.calloutTimer = 1.65;
+  }
+
+  private pushWarning(text: string, duration = 1.2): void {
+    this.activeWarning = text;
+    this.warningTimer = duration;
+  }
+
+  private loop = (now: number): void => {
+    if (this.disposed) return;
+
+    const rawDt = (now - this.lastTime) / 1000;
+    this.lastTime = now;
+    const dt = Math.min(Math.max(rawDt, 0.001), 0.05);
+
+    this.update(dt);
+    this.renderer.render(this.scene, this.camera);
+
+    if (this.isSoftwareGl) {
+      this.afterDraw(() => this.loop(performance.now()));
+    } else {
+      this.frameId = requestAnimationFrame(this.loop);
+    }
+  };
+
+  private afterDraw(cb: () => void): void {
+    const gl = this.renderer.getContext() as WebGL2RenderingContext;
+    if (!gl || typeof gl.fenceSync !== 'function') {
+      this.frameId = window.setTimeout(cb, 80);
+      return;
+    }
+    const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    gl.flush();
+    const poll = () => {
+      if (this.disposed) return;
+      const state = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
+      if (state === gl.UNSIGNALED) {
+        this.frameId = window.setTimeout(poll, 5);
+      } else {
+        if (sync) gl.deleteSync(sync);
+        this.frameId = window.setTimeout(cb, 80);
+      }
+    };
+    this.frameId = window.setTimeout(poll, 5);
+  }
+
+  private update(dt: number): void {
+    this.elapsed += dt;
+
+    if (this.phase === 'paused' || this.phase === 'gameover' || this.phase === 'victory') {
+      soundEngine.updateRollingSound(0, true, false);
+      return;
+    }
+
+    if (this.hitstopTimer > 0) {
+      this.hitstopTimer -= dt;
+      this.shakeIntensity = Math.max(0, this.shakeIntensity - dt * 1.4);
+      this.updateCamera(dt);
+      return;
+    }
+
+    if (this.phase === 'title') {
+      this.updateTitleCruise(dt);
+      return;
+    }
+
+    // Active Playing Loop
+    this.updateTimers(dt);
+    this.updatePlayer(dt);
+    this.scrollWorld(dt);
+    this.spawnSystem();
+    this.updateHazards(dt);
+    this.updatePickups(dt);
+    this.updateParticles(dt);
+    this.updateCamera(dt);
+
+    // Check Victory on finite routes
+    const targetDist = this.getTargetDistance();
+    if (targetDist !== null && this.distanceM >= targetDist) {
+      this.finishRun(true);
+      return;
+    }
+
+    if (this.elapsed - this.lastHudPush >= 0.05) {
+      this.pushHud(false);
+    }
+  }
+
+  private updateTitleCruise(dt: number): void {
+    const cruiseSpeed = 8.8;
+    this.playerX = THREE.MathUtils.damp(this.playerX, 3.2 + Math.sin(this.elapsed * 0.55) * 0.35, 3, dt);
+    this.scrollSegmentsOnly(cruiseSpeed * dt);
+
+    this.wheelAngle -= (cruiseSpeed * dt) / 0.34;
+    this.crankAngle -= cruiseSpeed * dt * 1.25;
+    this.animateBikeRig(0, 0);
+
+    // Sweeping GTA-style camera pan behind and around the cyclist
+    const angle = Math.sin(this.elapsed * 0.35) * 0.42;
+    _vec3A.set(
+      this.playerX + Math.sin(angle) * 3.8,
+      2.1 + Math.sin(this.elapsed * 0.4) * 0.25,
+      4.5 + Math.cos(angle) * 0.7
+    );
+    this.camPos.lerp(_vec3A, 1 - Math.exp(-4 * dt));
+    _vec3B.set(this.playerX - 0.4, 1.05, -7.5);
+    this.camLook.lerp(_vec3B, 1 - Math.exp(-5 * dt));
+
+    this.camera.position.copy(this.camPos);
+    this.camera.lookAt(this.camLook);
+    this.sunLight.position.set(this.playerX + 16, 28, 14);
+    this.sunLight.target.position.set(this.playerX, 0, -10);
+  }
+
+  private updateTimers(dt: number): void {
+    if (this.bellCooldown > 0) this.bellCooldown = Math.max(0, this.bellCooldown - dt);
+    if (this.invulnTimer > 0) this.invulnTimer = Math.max(0, this.invulnTimer - dt);
+    if (this.doubleScoreTimer > 0) this.doubleScoreTimer = Math.max(0, this.doubleScoreTimer - dt);
+    if (this.jumpBufferTimer > 0) this.jumpBufferTimer = Math.max(0, this.jumpBufferTimer - dt);
+    if (this.calloutTimer > 0) {
+      this.calloutTimer -= dt;
+      if (this.calloutTimer <= 0) this.activeCallout = null;
+    }
+    if (this.warningTimer > 0) {
+      this.warningTimer -= dt;
+      if (this.warningTimer <= 0) this.activeWarning = null;
+    }
+    if (this.brakeSoundCooldown > 0) this.brakeSoundCooldown -= dt;
+
+    if (this.bellRingLife > 0) {
+      this.bellRingLife -= dt;
+      const progress = 1 - Math.max(0, this.bellRingLife) / 0.55;
+      const scale = 1 + progress * 14;
+      this.bellRingMesh.scale.setScalar(scale);
+      this.bellRingMesh.position.x = this.playerX;
+      (this.bellRingMesh.material as THREE.MeshBasicMaterial).opacity = (1 - progress) * 0.72;
+      if (this.bellRingLife <= 0) {
+        this.bellRingMesh.visible = false;
+      }
+    }
+  }
+
+  private updatePlayer(dt: number): void {
+    const left = this.heldKeys.has('KeyA') || this.heldKeys.has('ArrowLeft') || this.mobileInput.left;
+    const right = this.heldKeys.has('KeyD') || this.heldKeys.has('ArrowRight') || this.mobileInput.right;
+    const accel = this.heldKeys.has('KeyW') || this.heldKeys.has('ArrowUp') || this.mobileInput.accel;
+    const brake = this.heldKeys.has('KeyS') || this.heldKeys.has('ArrowDown') || this.mobileInput.brake;
+
+    // Difficulty speed ramp
+    const zoneFactor = Math.min(this.distanceM / 1400, 1);
+    const baseCruise = (this.mode === 'school' ? 9.2 : 10.6) + zoneFactor * 3.2;
+    const maxSpeed = baseCruise + 4.4;
+    const minSpeed = 2.6;
+
+    let targetSpeed = baseCruise;
+    if (accel) targetSpeed = maxSpeed;
+    if (brake) targetSpeed = minSpeed;
+
+    const accelRate = brake ? 9.5 : accel ? 4.2 : 2.8;
+    this.speed = THREE.MathUtils.damp(this.speed, targetSpeed, accelRate, dt);
+
+    // Brake light & brake audio
+    this.bikeRig.tailLightMat.emissiveIntensity = brake ? 3.2 : 0.65;
+    if (brake && this.speed > 5.0 && this.brakeSoundCooldown <= 0 && this.grounded) {
+      soundEngine.playBrake();
+      this.brakeSoundCooldown = 0.25;
+      this.spawnBurst(this.playerX, 0.08, 0.6, 0x94a3b8, 2, 1.5);
+    }
+
+    if (this.slipTimer > 0) this.slipTimer = Math.max(0, this.slipTimer - dt);
+
+    // Warn when riding on wrong/oncoming left side of yellow double line
+    if (this.playerX < -1.1) {
+      this.wrongLaneTimer += dt;
+      if (this.wrongLaneTimer > 0.55 && !this.activeWarning) {
+        this.pushWarning('중앙선 침범! 역주행 차량 충돌 위험 (우측 자전거 도로 복귀)', 1.0);
+      }
+    } else {
+      this.wrongLaneTimer = 0;
+    }
+
+    // Lateral steering (responsive, analog-smooth counter-lean, with wet/gravel slip wobble)
+    const steerInput = (right ? 1 : 0) - (left ? 1 : 0);
+    const maxLateralSpeed = 6.8;
+    const slipWobble = this.slipTimer > 0 ? Math.sin(this.elapsed * 26) * 3.8 : 0;
+    const targetVX = steerInput * maxLateralSpeed + slipWobble;
+    this.playerVX = THREE.MathUtils.damp(this.playerVX, targetVX, steerInput !== 0 ? 11 : 13, dt);
+    this.playerX += this.playerVX * dt;
+    this.playerX = THREE.MathUtils.clamp(this.playerX, -ROAD_HALF_WIDTH, ROAD_HALF_WIDTH);
+
+    // Coyote time & buffered jump
+    if (this.grounded) {
+      this.coyoteTimer = 0.09;
+    } else {
+      this.coyoteTimer = Math.max(0, this.coyoteTimer - dt);
+    }
+
+    if (this.jumpBufferTimer > 0 && this.coyoteTimer > 0) {
+      this.playerVY = 8.4;
+      this.grounded = false;
+      this.jumpBufferTimer = 0;
+      this.coyoteTimer = 0;
+      soundEngine.playJump();
+      this.spawnBurst(this.playerX, 0.08, 0.3, 0xe2e8f0, 5, 2.2);
+    }
+
+    // Vertical physics
+    if (!this.grounded) {
+      this.playerVY -= 23.5 * dt;
+      this.playerY += this.playerVY * dt;
+      if (this.playerY <= 0) {
+        this.playerY = 0;
+        this.playerVY = 0;
+        this.grounded = true;
+        this.spawnBurst(this.playerX, 0.08, 0.3, 0xcbd5e1, 4, 2.0);
+      }
+    }
+
+    // Distance & continuous riding score
+    const deltaDist = this.speed * dt;
+    this.distanceM += deltaDist;
+    const scoreMult = (this.doubleScoreTimer > 0 ? 2 : 1) * (1 + Math.min(this.combo, 8) * 0.1);
+    this.score += deltaDist * 4.5 * scoreMult;
+
+    // Bike kinematics & invulnerability blink
+    this.wheelAngle -= deltaDist / 0.34;
+    this.crankAngle -= deltaDist * 1.25;
+    this.leanAngle = THREE.MathUtils.damp(this.leanAngle, -this.playerVX * 0.075, 10, dt);
+    this.steerVisual = THREE.MathUtils.damp(this.steerVisual, -this.playerVX * 0.045, 12, dt);
+
+    this.bikeRig.root.position.set(this.playerX, this.playerY, 0);
+    this.bikeRig.contactShadow.scale.setScalar(Math.max(0.55, 1 - this.playerY * 0.35));
+    this.bikeRig.shieldBubble.visible = this.hasShield;
+    if (this.hasShield) {
+      this.bikeRig.shieldBubble.rotation.y += dt * 1.5;
+    }
+
+    if (this.invulnTimer > 0) {
+      this.bikeRig.leanGroup.visible = Math.floor(this.invulnTimer * 18) % 2 === 0;
+    } else {
+      this.bikeRig.leanGroup.visible = true;
+    }
+
+    this.animateBikeRig(this.leanAngle, this.steerVisual);
+
+    // Rolling sound
+    soundEngine.updateRollingSound((this.speed - 2) / 14, this.grounded, true);
+  }
+
+  private animateBikeRig(lean: number, steer: number): void {
+    this.bikeRig.leanGroup.rotation.z = lean;
+    this.bikeRig.forkGroup.rotation.y = steer;
+    this.bikeRig.frontWheel.rotation.x = this.wheelAngle;
+    this.bikeRig.rearWheel.rotation.x = this.wheelAngle;
+    this.bikeRig.crankGroup.rotation.x = this.crankAngle;
+
+    // Pedaling legs alternating with crank phase
+    this.bikeRig.leftLegPivot.rotation.x = Math.sin(this.crankAngle) * 0.42 - 0.12;
+    this.bikeRig.rightLegPivot.rotation.x = Math.sin(this.crankAngle + Math.PI) * 0.42 - 0.12;
+    this.bikeRig.riderTorso.rotation.z = lean * 0.35;
+  }
+
+  private scrollWorld(dt: number): void {
+    const dz = this.speed * dt;
+    this.scrollSegmentsOnly(dz);
+    this.nextSpawnZ += dz;
+    this.nextTrafficZ += dz;
+  }
+
+  private scrollSegmentsOnly(dz: number): void {
+    for (const seg of this.segments) {
+      seg.z += dz;
+      if (seg.z > 42) {
+        seg.z -= TOTAL_ROAD_LEN;
+      }
+      seg.group.position.z = seg.z;
+    }
+  }
+
+  private spawnSystem(): void {
+    while (this.nextSpawnZ > -118) {
+      const gap = this.mode === 'school'
+        ? 24 + Math.random() * 8
+        : Math.max(16.5, 23 - (this.distanceM / 1500) * 5) + Math.random() * 7;
+      this.nextSpawnZ -= gap;
+      this.spawnHazardCluster(this.nextSpawnZ);
+
+      if (Math.random() < 0.4) {
+        this.spawnPickup(this.nextSpawnZ - gap * 0.45);
+      }
+    }
+
+    // Spawn moving road traffic in car lanes so player cannot cheese by riding in empty car lanes
+    while (this.nextTrafficZ > -125) {
+      const trafficGap = this.mode === 'school'
+        ? 28 + Math.random() * 14
+        : Math.max(18, 26 - (this.distanceM / 1600) * 6) + Math.random() * 10;
+      this.nextTrafficZ -= trafficGap;
+      this.spawnTrafficCar(this.nextTrafficZ);
+    }
+  }
+
+  private spawnTrafficCar(z: number): void {
+    // Check if there is a red_signal or bike-lane hazard nearby so we always keep a fair escape route
+    const nearbyHazard = this.hazards.some(
+      (h) => h.type !== 'traffic_car' && Math.abs(h.z - z) < 12.5
+    );
+    const oncoming = Math.random() < 0.46;
+    // If center-right lane (+0.55) would pinch a bike-lane hazard at the exact same Z, shift to oncoming lane (-2.65)
+    const useOncoming = oncoming || nearbyHazard;
+
+    const carColors = [0x94a3b8, 0x1e293b, 0x3b82f6, 0x0f766e, 0xe2e8f0, 0x7c2d12];
+    const id = this.hazardIdSeq++;
+    const carRig = createCarRig(carColors[id % carColors.length], this.contactShadowTex);
+
+    const x = useOncoming ? -2.65 : 0.55;
+    carRig.root.position.set(x, 0, z);
+    if (useOncoming) {
+      carRig.root.rotation.y = Math.PI; // Faces +Z oncoming toward player!
+    }
+    this.scene.add(carRig.root);
+    this.encounterCounts.traffic_car++;
+
+    this.hazards.push({
+      id,
+      type: 'traffic_car',
+      group: carRig.root,
+      x,
+      z,
+      width: 1.88,
+      depth: 4.2,
+      height: 1.5,
+      passed: false,
+      hit: false,
+      nearMissAwarded: false,
+      defensiveAwarded: false,
+      carRig,
+      doorOpenProgress: 0,
+      sideDir: useOncoming ? -1 : 1,
+      startX: x,
+      targetX: x,
+      alertedByBell: false,
+      forwardSpeed: useOncoming ? -(10.5 + Math.random() * 3.5) : 7.4 + Math.random() * 2.4,
+      braking: false,
+      signalState: 'green',
+      walkPhase: 0,
+    });
+  }
+
+  private pullNextHazardType(): HazardType {
+    const zone = this.getZoneInfo().index;
+    if (this.hazardBag.length === 0) {
+      const basePool: HazardType[] =
+        zone === 1
+          ? ['pet', 'kids', 'puddle', 'gravel', 'smombie', 'wrong_way_bike', 'dooring', 'pothole']
+          : zone === 2
+          ? ['pet', 'kids', 'wrong_way_bike', 'puddle', 'gravel', 'blind_car', 'smombie', 'red_signal', 'pothole', 'dooring', 'roadwork']
+          : ['pet', 'kids', 'wrong_way_bike', 'puddle', 'gravel', 'blind_car', 'smombie', 'red_signal', 'scooter', 'pothole', 'roadwork', 'dooring'];
+
+      // Fisher-Yates shuffle so dooring never repeats back-to-back and all hazards appear evenly
+      const bag = [...basePool];
+      for (let i = bag.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [bag[i], bag[j]] = [bag[j], bag[i]];
+      }
+      this.hazardBag = bag;
+    }
+    return this.hazardBag.pop()!;
+  }
+
+  private spawnHazardCluster(z: number): void {
+    const type = this.pullNextHazardType();
+    const id = this.hazardIdSeq++;
+    this.encounterCounts[type]++;
+
+    if (type === 'dooring') {
+      const carColors = [0xe2e8f0, 0x334155, 0x475569, 0x1d4ed8, 0xb91c1c];
+      const carRig = createCarRig(carColors[id % carColors.length], this.contactShadowTex);
+      const x = 4.35; // Parked along right curb/bike lane edge
+      carRig.root.position.set(x, 0, z);
+      this.scene.add(carRig.root);
+      this.hazards.push({
+        id,
+        type,
+        group: carRig.root,
+        x,
+        z,
+        width: 1.9,
+        depth: 4.2,
+        height: 1.5,
+        passed: false,
+        hit: false,
+        nearMissAwarded: false,
+        defensiveAwarded: false,
+        carRig,
+        doorOpenProgress: 0,
+        sideDir: -1,
+        startX: x,
+        targetX: x,
+        alertedByBell: false,
+        forwardSpeed: 0,
+        braking: false,
+        signalState: 'green',
+        walkPhase: 0,
+      });
+    } else if (type === 'blind_car') {
+      const carRig = createCarRig(0xf8fafc, this.contactShadowTex);
+      const fromRight = Math.random() > 0.4;
+      const startX = fromRight ? 7.6 : -7.6;
+      const targetX = fromRight ? 1.55 : -1.45;
+      carRig.root.position.set(startX, 0, z);
+      carRig.root.rotation.y = fromRight ? Math.PI / 2 : -Math.PI / 2;
+      carRig.headlightBeam.visible = true;
+      this.scene.add(carRig.root);
+
+      // Ground warning chevron decal on road ahead of emerging car
+      const warningMesh = new THREE.Mesh(
+        new THREE.PlaneGeometry(2.8, 2.8),
+        new THREE.MeshBasicMaterial({
+          map: this.chevronTex,
+          transparent: true,
+          opacity: 0.9,
+          depthWrite: false,
+        })
+      );
+      warningMesh.rotation.x = -Math.PI / 2;
+      warningMesh.rotation.z = fromRight ? Math.PI : 0;
+      warningMesh.position.set(fromRight ? 3.1 : -3.1, 0.04, z);
+      this.scene.add(warningMesh);
+
+      this.hazards.push({
+        id,
+        type,
+        group: carRig.root,
+        x: startX,
+        z,
+        width: 3.6,
+        depth: 1.9,
+        height: 1.5,
+        passed: false,
+        hit: false,
+        nearMissAwarded: false,
+        defensiveAwarded: false,
+        carRig,
+        warningMesh,
+        doorOpenProgress: 0,
+        sideDir: fromRight ? -1 : 1,
+        startX,
+        targetX,
+        alertedByBell: false,
+        forwardSpeed: 0,
+        braking: false,
+        signalState: 'green',
+        walkPhase: 0,
+      });
+    } else if (type === 'smombie') {
+      const shirtColors = [0xec4899, 0x8b5cf6, 0x06b6d4, 0x10b981];
+      const pedRig = createPedestrianRig(shirtColors[id % shirtColors.length], this.contactShadowTex);
+      const startX = 4.25;
+      const targetX = 2.6 + Math.random() * 0.9; // Wanders into the red bike lane!
+      pedRig.root.position.set(startX, 0, z);
+      this.scene.add(pedRig.root);
+      this.hazards.push({
+        id,
+        type,
+        group: pedRig.root,
+        x: startX,
+        z,
+        width: 0.75,
+        depth: 0.75,
+        height: 1.65,
+        passed: false,
+        hit: false,
+        nearMissAwarded: false,
+        defensiveAwarded: false,
+        pedRig,
+        doorOpenProgress: 0,
+        sideDir: -1,
+        startX,
+        targetX,
+        alertedByBell: false,
+        forwardSpeed: 1.2,
+        braking: false,
+        signalState: 'green',
+        walkPhase: Math.random() * 6,
+      });
+    } else if (type === 'pothole') {
+      const group = new THREE.Group();
+      const x = [3.25, 0.7, -2.2][id % 3];
+      const grate = new THREE.Mesh(
+        new THREE.PlaneGeometry(1.5, 1.5),
+        new THREE.MeshStandardMaterial({
+          map: this.potholeTex,
+          roughness: 0.7,
+          metalness: 0.4,
+          polygonOffset: true,
+          polygonOffsetFactor: -1,
+          polygonOffsetUnits: -1,
+        })
+      );
+      grate.rotation.x = -Math.PI / 2;
+      grate.position.y = 0.04;
+      group.add(grate);
+      group.position.set(x, 0, z);
+      this.scene.add(group);
+      this.hazards.push({
+        id,
+        type,
+        group,
+        x,
+        z,
+        width: 1.35,
+        depth: 1.35,
+        height: 0.25, // Jumpable!
+        passed: false,
+        hit: false,
+        nearMissAwarded: false,
+        defensiveAwarded: false,
+        doorOpenProgress: 0,
+        sideDir: 0,
+        startX: x,
+        targetX: x,
+        alertedByBell: false,
+        forwardSpeed: 0,
+        braking: false,
+        signalState: 'green',
+        walkPhase: 0,
+      });
+    } else if (type === 'roadwork') {
+      const group = createRoadworkGroup();
+      const x = [3.15, 0.7, -2.1][id % 3];
+      group.position.set(x, 0, z);
+      this.scene.add(group);
+      this.hazards.push({
+        id,
+        type,
+        group,
+        x,
+        z,
+        width: 1.75,
+        depth: 0.65,
+        height: 0.68, // Low enough to bunny-hop or steer around!
+        passed: false,
+        hit: false,
+        nearMissAwarded: false,
+        defensiveAwarded: false,
+        doorOpenProgress: 0,
+        sideDir: 0,
+        startX: x,
+        targetX: x,
+        alertedByBell: false,
+        forwardSpeed: 0,
+        braking: false,
+        signalState: 'green',
+        walkPhase: 0,
+      });
+    } else if (type === 'scooter') {
+      const scooterRig = createScooterRig(this.contactShadowTex);
+      const x = Math.random() > 0.45 ? 0.75 : 3.2;
+      scooterRig.root.position.set(x, 0, z);
+      this.scene.add(scooterRig.root);
+      this.hazards.push({
+        id,
+        type,
+        group: scooterRig.root,
+        x,
+        z,
+        width: 0.95,
+        depth: 1.85,
+        height: 1.4,
+        passed: false,
+        hit: false,
+        nearMissAwarded: false,
+        defensiveAwarded: false,
+        scooterRig,
+        doorOpenProgress: 0,
+        sideDir: 0,
+        startX: x,
+        targetX: x,
+        alertedByBell: false,
+        forwardSpeed: 5.5,
+        braking: false,
+        signalState: 'green',
+        walkPhase: 0,
+      });
+    } else if (type === 'red_signal') {
+      const signalRig = createSignalGantry();
+      signalRig.root.position.set(0, 0, z);
+      this.scene.add(signalRig.root);
+
+      // White stop line bar on road at z + 4.5
+      const stopLine = new THREE.Mesh(
+        new THREE.PlaneGeometry(9.6, 0.55),
+        new THREE.MeshBasicMaterial({ color: 0xf8fafc })
+      );
+      stopLine.rotation.x = -Math.PI / 2;
+      stopLine.position.set(0, 0.04, z + 4.8);
+      signalRig.root.add(stopLine);
+
+      this.hazards.push({
+        id,
+        type,
+        group: signalRig.root,
+        x: 0,
+        z,
+        width: 10.4,
+        depth: 1.0,
+        height: 5.0,
+        passed: false,
+        hit: false,
+        nearMissAwarded: false,
+        defensiveAwarded: false,
+        signalRig,
+        doorOpenProgress: 0,
+        sideDir: 0,
+        startX: 0,
+        targetX: 0,
+        alertedByBell: false,
+        forwardSpeed: 0,
+        braking: false,
+        signalState: 'green',
+        walkPhase: 0,
+      });
+    } else if (type === 'pet') {
+      const dogRig = createDogRig(this.contactShadowTex);
+      const startX = 5.3;
+      const targetX = 2.6 + Math.random() * 0.9;
+      dogRig.root.position.set(startX, 0, z);
+      this.scene.add(dogRig.root);
+      this.hazards.push({
+        id,
+        type,
+        group: dogRig.root,
+        x: startX,
+        z,
+        width: 0.9,
+        depth: 0.65,
+        height: 0.72,
+        passed: false,
+        hit: false,
+        nearMissAwarded: false,
+        defensiveAwarded: false,
+        dogRig,
+        doorOpenProgress: 0,
+        sideDir: -1,
+        startX,
+        targetX,
+        alertedByBell: false,
+        forwardSpeed: 0,
+        braking: false,
+        signalState: 'green',
+        walkPhase: 0,
+      });
+    } else if (type === 'kids') {
+      const kidsRig = createKidsGroup(this.contactShadowTex);
+      const startX = 4.1;
+      const targetX = 2.6 + Math.random() * 0.85;
+      kidsRig.root.position.set(startX, 0, z);
+      this.scene.add(kidsRig.root);
+      this.hazards.push({
+        id,
+        type,
+        group: kidsRig.root,
+        x: startX,
+        z,
+        width: 1.25,
+        depth: 0.85,
+        height: 1.35,
+        passed: false,
+        hit: false,
+        nearMissAwarded: false,
+        defensiveAwarded: false,
+        kidsRig,
+        doorOpenProgress: 0,
+        sideDir: -1,
+        startX,
+        targetX,
+        alertedByBell: false,
+        forwardSpeed: 1.1,
+        braking: false,
+        signalState: 'green',
+        walkPhase: Math.random() * 5,
+      });
+    } else if (type === 'wrong_way_bike') {
+      const wrongBikeRig = createWrongWayBikeRig(this.contactShadowTex);
+      const x = 3.25;
+      wrongBikeRig.root.position.set(x, 0, z);
+      this.scene.add(wrongBikeRig.root);
+      this.hazards.push({
+        id,
+        type,
+        group: wrongBikeRig.root,
+        x,
+        z,
+        width: 0.72,
+        depth: 1.7,
+        height: 1.5,
+        passed: false,
+        hit: false,
+        nearMissAwarded: false,
+        defensiveAwarded: false,
+        wrongBikeRig,
+        doorOpenProgress: 0,
+        sideDir: 0,
+        startX: x,
+        targetX: x,
+        alertedByBell: false,
+        forwardSpeed: -5.2, // Rides directly toward the player!
+        braking: false,
+        signalState: 'green',
+        walkPhase: 0,
+      });
+    } else if (type === 'puddle') {
+      const group = new THREE.Group();
+      const x = [3.2, 2.5, 0.7][id % 3];
+      const puddleMesh = new THREE.Mesh(
+        new THREE.PlaneGeometry(1.9, 2.2),
+        new THREE.MeshPhysicalMaterial({
+          map: this.puddleTex,
+          transparent: true,
+          roughness: 0.08,
+          metalness: 0.15,
+          clearcoat: 1.0,
+          polygonOffset: true,
+          polygonOffsetFactor: -1,
+          polygonOffsetUnits: -1,
+        })
+      );
+      puddleMesh.rotation.x = -Math.PI / 2;
+      puddleMesh.position.y = 0.04;
+      group.add(puddleMesh);
+      group.position.set(x, 0, z);
+      this.scene.add(group);
+      this.hazards.push({
+        id,
+        type,
+        group,
+        x,
+        z,
+        width: 1.55,
+        depth: 1.85,
+        height: 0.22,
+        passed: false,
+        hit: false,
+        nearMissAwarded: false,
+        defensiveAwarded: false,
+        doorOpenProgress: 0,
+        sideDir: 0,
+        startX: x,
+        targetX: x,
+        alertedByBell: false,
+        forwardSpeed: 0,
+        braking: false,
+        signalState: 'green',
+        walkPhase: 0,
+      });
+    } else if (type === 'gravel') {
+      const group = createGravelGroup();
+      const x = [3.25, 2.4, 3.6][id % 3];
+      group.position.set(x, 0, z);
+      this.scene.add(group);
+      this.hazards.push({
+        id,
+        type,
+        group,
+        x,
+        z,
+        width: 1.45,
+        depth: 1.45,
+        height: 0.24,
+        passed: false,
+        hit: false,
+        nearMissAwarded: false,
+        defensiveAwarded: false,
+        doorOpenProgress: 0,
+        sideDir: 0,
+        startX: x,
+        targetX: x,
+        alertedByBell: false,
+        forwardSpeed: 0,
+        braking: false,
+        signalState: 'green',
+        walkPhase: 0,
+      });
+    }
+  }
+
+  private spawnPickup(z: number): void {
+    const roll = Math.random();
+    const kind: 'shield' | 'double' | 'star' = roll < 0.25 ? 'shield' : roll < 0.5 ? 'double' : 'star';
+    const group = createPickupGroup(kind);
+    const lanes = [-2.1, 0.7, 3.25];
+    const x = lanes[Math.floor(Math.random() * lanes.length)];
+    group.position.set(x, 0, z);
+    this.scene.add(group);
+    this.pickups.push({ kind, group, x, z, collected: false });
+  }
+
+  private updateHazards(dt: number): void {
+    const dzWorld = this.speed * dt;
+    const blinkOn = Math.floor(this.elapsed * 8) % 2 === 0;
+
+    for (let i = this.hazards.length - 1; i >= 0; i--) {
+      const h = this.hazards[i];
+      h.z += dzWorld - h.forwardSpeed * dt;
+      h.group.position.z = h.z;
+      if (h.warningMesh) {
+        h.warningMesh.position.z = h.z;
+        (h.warningMesh.material as THREE.MeshBasicMaterial).opacity = blinkOn ? 0.92 : 0.35;
+      }
+
+      // 1. Update hazard-specific telegraphs & kinematics
+      if (h.type === 'dooring' && h.carRig) {
+        if (h.z > -42 && h.z < 4) {
+          h.carRig.hazardLeftMat.emissiveIntensity = blinkOn ? 2.4 : 0.2;
+          h.carRig.hazardRightMat.emissiveIntensity = blinkOn ? 2.4 : 0.2;
+        }
+        if (h.z > -40 && h.z < -25 && !this.activeWarning) {
+          this.pushWarning('주차 차량 비상등 점멸! 문 열림 주의 (안전거리 1m 확보)', 1.1);
+        }
+        if (h.z > -24) {
+          h.doorOpenProgress = Math.min(1, h.doorOpenProgress + dt * 3.8);
+          h.carRig.doorPivot.rotation.y = -1.25 * h.doorOpenProgress;
+        }
+      } else if (h.type === 'blind_car' && h.carRig) {
+        if (h.z > -48 && h.z < -30) {
+          if (!this.activeWarning) {
+            this.pushWarning('골목 사각지대 차량 접근! S키로 감속하세요', 1.2);
+          }
+          if (Math.abs(h.z + 38) < 0.8) {
+            soundEngine.playCarHorn();
+          }
+        }
+        if (h.z > -32) {
+          h.x = THREE.MathUtils.damp(h.x, h.targetX, 3.4, dt);
+          h.group.position.x = h.x;
+        }
+        // Check defensive braking near blind car
+        if (!h.defensiveAwarded && h.z > -10 && h.z < 2 && this.speed < 5.2 && !h.hit) {
+          h.defensiveAwarded = true;
+          this.defensiveCount++;
+          this.awardBonus('사각지대 감속 방어운전!', 180, 'good');
+        }
+      } else if (h.type === 'smombie' && h.pedRig) {
+        h.walkPhase += dt * 7;
+        h.pedRig.leftLeg.rotation.x = Math.sin(h.walkPhase) * 0.45;
+        h.pedRig.rightLeg.rotation.x = -Math.sin(h.walkPhase) * 0.45;
+
+        if (h.alertedByBell) {
+          h.x = THREE.MathUtils.damp(h.x, h.targetX, 6.0, dt);
+        } else if (h.z > -30) {
+          h.x = THREE.MathUtils.damp(h.x, h.targetX, 2.2, dt);
+          if (h.z < -16 && !this.activeWarning) {
+            this.pushWarning('전방 스마트폰 보행자! E키(경적) 또는 우회하세요', 1.1);
+          }
+        }
+        h.group.position.x = h.x;
+      } else if (h.type === 'scooter' && h.scooterRig) {
+        h.scooterRig.frontWheel.rotation.x -= h.forwardSpeed * dt / 0.24;
+        h.scooterRig.rearWheel.rotation.x -= h.forwardSpeed * dt / 0.24;
+        if (h.z > -28 && !h.braking) {
+          h.braking = true;
+          h.forwardSpeed = 1.6; // abrupt brake!
+          h.scooterRig.brakeMat.emissiveIntensity = 3.2;
+          if (!this.activeWarning) {
+            this.pushWarning('전방 오토바이 급정거! 브레이크 또는 차로 변경', 1.1);
+          }
+        }
+      } else if (h.type === 'red_signal' && h.signalRig) {
+        if (h.z > -42 && h.z <= -28) {
+          h.signalState = 'yellow';
+          h.signalRig.greenMat.emissiveIntensity = 0.1;
+          h.signalRig.yellowMat.emissiveIntensity = 2.0;
+          if (!this.activeWarning) {
+            this.pushWarning('황색 신호! 정지선 앞에 감속하세요 (S키)', 1.2);
+          }
+        } else if (h.z > -28 && !h.defensiveAwarded) {
+          h.signalState = 'red';
+          h.signalRig.yellowMat.emissiveIntensity = 0.1;
+          h.signalRig.redMat.emissiveIntensity = 2.4;
+          if (!this.activeWarning) {
+            this.pushWarning('적색 신호! 정지선 앞에서 감속 정지하세요 (S키)', 1.2);
+          }
+        }
+        // Check if player slowed before stop line (z between -9 and +2)
+        if (h.signalState === 'red' && !h.defensiveAwarded && h.z > -9 && h.z < 1) {
+          if (this.speed <= 3.9) {
+            h.defensiveAwarded = true;
+            h.signalState = 'green';
+            h.signalRig.redMat.emissiveIntensity = 0.1;
+            h.signalRig.greenMat.emissiveIntensity = 2.0;
+            this.defensiveCount++;
+            this.awardBonus('신호 · 정지선 준수!', 240, 'good');
+          }
+        }
+      } else if (h.type === 'pet' && h.dogRig) {
+        h.walkPhase += dt * 16;
+        h.dogRig.legs.forEach((leg, idx) => {
+          leg.rotation.z = Math.sin(h.walkPhase + (idx % 2 === 0 ? 0 : Math.PI)) * 0.45;
+        });
+        h.dogRig.tail.rotation.y = Math.sin(this.elapsed * 18) * 0.45;
+        if (h.alertedByBell) {
+          h.x = THREE.MathUtils.damp(h.x, h.targetX, 6.5, dt);
+        } else if (h.z > -32) {
+          if (!h.braking) {
+            h.braking = true;
+            soundEngine.playDogBark();
+            if (!this.activeWarning) {
+              this.pushWarning('전방 애완동물 돌진! 감속(S) 또는 경적(E)으로 멈추세요', 1.2);
+            }
+          }
+          h.x = THREE.MathUtils.damp(h.x, h.targetX, 3.8, dt);
+        }
+        h.group.position.x = h.x;
+      } else if (h.type === 'kids' && h.kidsRig) {
+        h.walkPhase += dt * 6;
+        h.kidsRig.childrenGroups.forEach((kg, idx) => {
+          kg.position.y = Math.abs(Math.sin(h.walkPhase + idx)) * 0.08;
+        });
+        if (h.alertedByBell) {
+          h.x = THREE.MathUtils.damp(h.x, h.targetX, 6.0, dt);
+        } else if (h.z > -32) {
+          h.x = THREE.MathUtils.damp(h.x, h.targetX + Math.sin(this.elapsed * 3.5) * 0.25, 2.4, dt);
+          if (h.z < -16 && !this.activeWarning) {
+            this.pushWarning('전방 어린이 보행! 서행 및 경적(E)으로 알리세요', 1.2);
+          }
+        }
+        h.group.position.x = h.x;
+      } else if (h.type === 'wrong_way_bike' && h.wrongBikeRig) {
+        const spin = Math.abs(h.forwardSpeed) * dt / 0.33;
+        h.wrongBikeRig.frontWheel.rotation.x -= spin;
+        h.wrongBikeRig.rearWheel.rotation.x -= spin;
+        if (h.z > -44 && h.z < -22 && !this.activeWarning) {
+          this.pushWarning('전방 역주행 자전거 접근! 속도를 줄이고 안전하게 피하세요', 1.2);
+        }
+      } else if (h.type === 'traffic_car') {
+        // Sound horn if oncoming car is close and player is in its lane
+        if (h.sideDir < 0 && h.z > -32 && h.z < -16 && Math.abs(this.playerX - h.x) < 1.35 && !h.braking) {
+          h.braking = true;
+          soundEngine.playCarHorn();
+        }
+      }
+
+      // 2. Collision & Near-Miss Detection around z ≈ 0 (bike length -0.8 to +0.8)
+      if (!h.hit) {
+        if (h.type === 'red_signal') {
+          if (h.signalState === 'red' && h.z > -0.6 && h.z < 1.2 && !h.defensiveAwarded) {
+            h.hit = true;
+            this.onHazardHit(h, '적색 신호 위반! 교차로 진입 전 정지하세요');
+          }
+        } else {
+          // Determine effective hazard X bounds
+          let hazMinX = h.x - h.width * 0.5;
+          let hazMaxX = h.x + h.width * 0.5;
+          let hazMinZ = h.z - h.depth * 0.5;
+          let hazMaxZ = h.z + h.depth * 0.5;
+
+          if (h.type === 'dooring') {
+            // Check both car body AND opened driver door!
+            const doorReach = h.doorOpenProgress * 1.15;
+            hazMinX = h.x - 0.95 - doorReach;
+            hazMaxX = h.x + 0.95;
+          }
+
+          const bikeHalfW = 0.28;
+          const bikeHalfD = 0.72;
+          const overlapX = this.playerX + bikeHalfW > hazMinX && this.playerX - bikeHalfW < hazMaxX;
+          const overlapZ = bikeHalfD > hazMinZ && -bikeHalfD < hazMaxZ;
+          const overlapY = this.playerY < h.height;
+
+          if (overlapX && overlapZ && overlapY) {
+            h.hit = true;
+            const msgMap: Record<HazardType, string> = {
+              dooring: '개문 사고 충돌! 주차 차량과 1m 거리를 두세요',
+              blind_car: '사각지대 차량 충돌! 교차로 감속이 필요합니다',
+              smombie: '보행자 충돌! 벨(E)로 미리 알리고 서행하세요',
+              pothole: '노면 배수구 전복! 점프(Space)나 조향으로 피하세요',
+              roadwork: '공사 장애물 충돌! 전방을 살피고 미리 차선 변경하세요',
+              scooter: '전방 급정거 추돌! 충분한 안전거리를 유지하세요',
+              red_signal: '적색 신호 위반!',
+              traffic_car: '차도 주행 차량과 충돌! 자전거 도로를 이용하세요',
+              pet: '애완동물과 충돌! 인도 근처에선 서행·경적 필수입니다',
+              kids: '어린이 보행자와 충돌! 스쿨존에서는 반드시 서행하세요',
+              wrong_way_bike: '역주행 자전거와 정면 충돌! 전방 주시 및 감속 필수',
+              puddle: '물웅덩이 수막현상 미끄러짐! 점프(Space)나 우회가 필요합니다',
+              gravel: '돌맹이·자갈 밟아 핸들 흔들림! 노면을 살피고 피하세요',
+            };
+            this.onHazardHit(h, msgMap[h.type]);
+          } else if (!h.nearMissAwarded && h.z > 0.3 && h.z < 2.2) {
+            // Near-miss reward if close horizontally or jumped cleanly over!
+            const distToEdge = Math.min(
+              Math.abs(this.playerX - hazMinX),
+              Math.abs(this.playerX - hazMaxX)
+            );
+            if (
+              overlapX &&
+              !overlapY &&
+              (h.type === 'pothole' || h.type === 'roadwork' || h.type === 'puddle' || h.type === 'gravel')
+            ) {
+              h.nearMissAwarded = true;
+              this.nearMissCount++;
+              soundEngine.playNearMiss(this.combo);
+              this.awardBonus('점프 회피 성공!', 140, 'good');
+            } else if (!overlapX && distToEdge < 0.78) {
+              h.nearMissAwarded = true;
+              this.nearMissCount++;
+              soundEngine.playNearMiss(this.combo);
+              this.awardBonus('아슬아슬 회피!', 180, 'good');
+            }
+          }
+        }
+      }
+
+      if (!h.passed && h.z > 2.5) {
+        h.passed = true;
+      }
+
+      // Cleanup behind camera or far ahead
+      if (h.z > 14 || h.z < -170) {
+        this.scene.remove(h.group);
+        if (h.warningMesh) this.scene.remove(h.warningMesh);
+        this.hazards.splice(i, 1);
+      }
+    }
+  }
+
+  private onHazardHit(h: ActiveHazard, reasonText: string): void {
+    if (this.invulnTimer > 0) return;
+
+    this.hitCounts[h.type]++;
+    this.lastFatalHazard = h.type;
+
+    if (this.hasShield) {
+      this.hasShield = false;
+      this.invulnTimer = 1.5;
+      this.hitstopTimer = 0.045;
+      this.shakeIntensity = 0.32;
+      soundEngine.playCrash(true);
+      this.spawnBurst(this.playerX, 0.9, 0, 0x38bdf8, 18, 6.5);
+      this.pushCallout('안전모 보호막이 충격을 막았습니다!', 100, 'warn');
+      return;
+    }
+
+    this.hearts = Math.max(0, this.hearts - 1);
+    this.combo = 0;
+    this.invulnTimer = 1.65;
+    this.hitstopTimer = 0.06;
+    this.shakeIntensity = 0.55;
+    this.speed = Math.max(4.5, this.speed * 0.48);
+
+    if (h.type === 'puddle') {
+      this.slipTimer = 0.85;
+      soundEngine.playSplash();
+      this.spawnBurst(this.playerX, 0.35, 0, 0x38bdf8, 22, 7.2);
+    } else if (h.type === 'gravel') {
+      this.slipTimer = 0.65;
+      soundEngine.playGravelCrunch();
+      this.spawnBurst(this.playerX, 0.3, 0, 0xa8a29e, 18, 6.5);
+    } else {
+      soundEngine.playCrash(false);
+      this.spawnBurst(this.playerX, 0.7, 0, 0xef4444, 20, 7.5);
+    }
+    this.callbacks.onCrashFlash();
+    this.pushCallout(reasonText, 0, 'danger');
+
+    if (this.hearts <= 0) {
+      this.finishRun(false);
+    } else {
+      this.pushHud(true);
+    }
+  }
+
+  private updatePickups(dt: number): void {
+    const dzWorld = this.speed * dt;
+    for (let i = this.pickups.length - 1; i >= 0; i--) {
+      const p = this.pickups[i];
+      p.z += dzWorld;
+      p.group.position.z = p.z;
+      p.group.rotation.y += dt * 2.4;
+      p.group.position.y = Math.sin(this.elapsed * 4 + i) * 0.1;
+
+      if (!p.collected && Math.abs(p.z) < 1.15 && Math.abs(this.playerX - p.x) < 0.9 && this.playerY < 1.4) {
+        p.collected = true;
+        soundEngine.playPickup();
+        this.spawnBurst(p.x, 0.8, 0, 0x22c55e, 10, 4.2);
+
+        if (p.kind === 'shield') {
+          this.hasShield = true;
+          this.awardBonus('안전모 보호막 장착!', 100, 'good');
+        } else if (p.kind === 'double') {
+          this.doubleScoreTimer = 8.0;
+          this.awardBonus('전조등 안전 점멸 (점수 2배!)', 100, 'good');
+        } else {
+          this.awardBonus('안전 주행 포인트!', 120, 'good');
+        }
+        this.scene.remove(p.group);
+        this.pickups.splice(i, 1);
+        continue;
+      }
+
+      if (p.z > 10) {
+        this.scene.remove(p.group);
+        this.pickups.splice(i, 1);
+      }
+    }
+  }
+
+  private updateParticles(dt: number): void {
+    for (const p of this.particles) {
+      if (p.life <= 0) continue;
+      p.life -= dt;
+      if (p.life <= 0) {
+        p.mesh.visible = false;
+        continue;
+      }
+      p.vy -= 14 * dt;
+      p.mesh.position.x += p.vx * dt;
+      p.mesh.position.y += p.vy * dt;
+      p.mesh.position.z += p.vz * dt;
+      p.mesh.rotation.x += dt * 6;
+      p.mesh.rotation.y += dt * 5;
+      (p.mesh.material as THREE.MeshBasicMaterial).opacity = Math.max(0, p.life / p.maxLife);
+    }
+  }
+
+  private updateCamera(dt: number): void {
+    // GTA-style dynamic 3rd-person chase camera with FOV speed expansion + shake
+    const speedRatio = THREE.MathUtils.clamp((this.speed - 4) / 12, 0, 1);
+    const targetFov = 61 + speedRatio * 10;
+    this.camera.fov = THREE.MathUtils.damp(this.camera.fov, targetFov, 6, dt);
+    this.camera.updateProjectionMatrix();
+
+    _vec3A.set(this.playerX * 0.88, 2.35 + this.playerY * 0.45, 4.35 + speedRatio * 0.35);
+    this.camPos.lerp(_vec3A, 1 - Math.exp(-9 * dt));
+
+    if (this.shakeIntensity > 0.005) {
+      this.shakeIntensity = Math.max(0, this.shakeIntensity - dt * 2.1);
+      this.camera.position.set(
+        this.camPos.x + (Math.random() - 0.5) * this.shakeIntensity,
+        this.camPos.y + (Math.random() - 0.5) * this.shakeIntensity * 0.7,
+        this.camPos.z
+      );
+    } else {
+      this.camera.position.copy(this.camPos);
+    }
+
+    _vec3B.set(this.playerX * 0.72, 1.05 + this.playerY * 0.3, -9.5);
+    this.camLook.lerp(_vec3B, 1 - Math.exp(-11 * dt));
+    this.camera.lookAt(this.camLook);
+    this.camera.rotation.z = -this.leanAngle * 0.14;
+
+    // Keep shadow frustum centered near cyclist
+    this.sunLight.position.set(this.playerX + 16, 28, 12);
+    this.sunLight.target.position.set(this.playerX, 0, -14);
+  }
+
+  private finishRun(cleared: boolean): void {
+    this.phase = cleared ? 'victory' : 'gameover';
+    soundEngine.updateRollingSound(0, true, false);
+    if (cleared) {
+      soundEngine.playVictory();
+    }
+
+    const finalScore = Math.round(this.score + (cleared ? this.hearts * 300 : 0));
+    const bestScore = this.saveBestScore(this.mode, finalScore);
+    const totalHits = Object.values(this.hitCounts).reduce((a, b) => a + b, 0);
+
+    let grade: 'S' | 'A' | 'B' | 'C' = 'C';
+    if (cleared && totalHits === 0) grade = 'S';
+    else if ((cleared && totalHits <= 1) || this.distanceM >= 1000) grade = 'A';
+    else if (this.distanceM >= 450 || this.defensiveCount + this.nearMissCount >= 4) grade = 'B';
+
+    this.pushHud(true);
+    this.callbacks.onPhaseChange(this.phase);
+    this.callbacks.onGameOver({
+      mode: this.mode,
+      cleared,
+      score: finalScore,
+      bestScore,
+      distanceM: Math.round(this.distanceM),
+      maxCombo: this.maxCombo,
+      nearMissCount: this.nearMissCount,
+      defensiveCount: this.defensiveCount,
+      totalHits,
+      grade,
+      hitCounts: { ...this.hitCounts },
+      encounterCounts: { ...this.encounterCounts },
+      lastFatalHazard: this.lastFatalHazard,
+    });
+  }
+
+  private pushHud(force: boolean): void {
+    if (!force && this.elapsed - this.lastHudPush < 0.05) return;
+    this.lastHudPush = this.elapsed;
+
+    const zone = this.getZoneInfo();
+    const brakeHeld = this.heldKeys.has('KeyS') || this.heldKeys.has('ArrowDown') || this.mobileInput.brake;
+
+    this.callbacks.onHudUpdate({
+      speedKmh: Math.round(this.speed * 2.4),
+      distanceM: Math.round(this.distanceM),
+      targetDistanceM: this.getTargetDistance(),
+      score: Math.round(this.score),
+      combo: this.combo,
+      maxCombo: this.maxCombo,
+      hearts: this.hearts,
+      maxHearts: this.maxHearts,
+      hasShield: this.hasShield,
+      doubleScoreTimer: Number(this.doubleScoreTimer.toFixed(1)),
+      bellCooldownRatio: this.bellCooldown / this.bellCooldownMax,
+      brakeActive: brakeHeld,
+      zoneName: zone.name,
+      zoneIndex: zone.index,
+      activeCallout: this.activeCallout,
+      activeWarning: this.activeWarning,
+      nearMissCount: this.nearMissCount,
+      defensiveCount: this.defensiveCount,
+      hitCounts: { ...this.hitCounts },
+      encounterCounts: { ...this.encounterCounts },
+    });
+  }
+
+  public dispose(): void {
+    this.disposed = true;
+    cancelAnimationFrame(this.frameId);
+    window.clearTimeout(this.frameId);
+    window.removeEventListener('resize', this.handleResize);
+    window.removeEventListener('keydown', this.handleKeyDown);
+    window.removeEventListener('keyup', this.handleKeyUp);
+    window.removeEventListener('blur', this.handleBlur);
+    soundEngine.updateRollingSound(0, true, false);
+
+    this.scene.traverse((obj) => {
+      if ((obj as THREE.Mesh).isMesh) {
+        const mesh = obj as THREE.Mesh;
+        mesh.geometry?.dispose();
+        if (Array.isArray(mesh.material)) {
+          mesh.material.forEach((m) => m.dispose());
+        } else {
+          mesh.material?.dispose();
+        }
+      }
+    });
+
+    this.contactShadowTex?.dispose();
+    this.potholeTex?.dispose();
+    this.puddleTex?.dispose();
+    this.chevronTex?.dispose();
+    this.roadTextures.forEach((t) => t.dispose());
+    this.buildingTextures.forEach((t) => t.dispose());
+    this.renderer.dispose();
+    if (this.renderer.domElement.parentElement === this.container) {
+      this.container.removeChild(this.renderer.domElement);
+    }
+  }
+}

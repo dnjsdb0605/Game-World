@@ -1,0 +1,6 @@
+{
+  "name": "라이딩 세이프 - 3D 자전거 안전 체험",
+  "description": "학생들이 3인칭 GTA 스타일 시점에서 자전거를 타며 개문 사고, 사각지대 차량, 스몸비 보행자 등 실제 도로 위험 상황을 예측하고 회피하는 3D 자전거 안전 교육 게임",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
