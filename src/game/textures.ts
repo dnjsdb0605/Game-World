@@ -583,3 +583,74 @@ export function createPuddleTexture(maxAnisotropy: number): THREE.CanvasTexture 
   tex.needsUpdate = true;
   return tex;
 }
+
+export function createTrajectoryArrowTexture(maxAnisotropy: number): THREE.CanvasTexture {
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 128;
+  const ctx = canvas.getContext('2d')!;
+  ctx.clearRect(0, 0, 256, 128);
+
+  // Repeating bright chevrons pointing toward +X
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.92)';
+  for (let i = 0; i < 3; i++) {
+    const ox = 16 + i * 82;
+    ctx.beginPath();
+    ctx.moveTo(ox, 20);
+    ctx.lineTo(ox + 38, 64);
+    ctx.lineTo(ox, 108);
+    ctx.lineTo(ox + 26, 108);
+    ctx.lineTo(ox + 64, 64);
+    ctx.lineTo(ox + 26, 20);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = maxAnisotropy;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.repeat.set(2, 1);
+  tex.needsUpdate = true;
+  return tex;
+}
+
+export function createDoorZoneTexture(maxAnisotropy: number): THREE.CanvasTexture {
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 512;
+  const ctx = canvas.getContext('2d')!;
+  ctx.clearRect(0, 0, 256, 512);
+
+  // Translucent red/amber door-swing warning box
+  ctx.fillStyle = 'rgba(245, 158, 11, 0.22)';
+  ctx.fillRect(10, 12, 236, 488);
+
+  ctx.strokeStyle = 'rgba(251, 191, 36, 0.85)';
+  ctx.lineWidth = 10;
+  ctx.setLineDash([28, 18]);
+  ctx.strokeRect(14, 16, 228, 480);
+  ctx.setLineDash([]);
+
+  // Diagonal hazard stripes
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(18, 20, 220, 472);
+  ctx.clip();
+  ctx.strokeStyle = 'rgba(245, 158, 11, 0.34)';
+  ctx.lineWidth = 18;
+  for (let y = -260; y < 780; y += 56) {
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(256, y + 220);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = maxAnisotropy;
+  tex.needsUpdate = true;
+  return tex;
+}

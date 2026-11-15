@@ -2,6 +2,16 @@ export type GamePhase = 'title' | 'playing' | 'paused' | 'gameover' | 'victory';
 
 export type DifficultyMode = 'school' | 'city' | 'endless';
 
+export type BikeType = 'normal' | 'ttareungi' | 'fixie' | 'pro' | 'custom';
+
+export type BikeFrameStyle = 'diamond' | 'stepthrough' | 'track' | 'aero';
+
+export interface CustomFrameDesign {
+  frameStyle: BikeFrameStyle;
+  /** Row-major (28 x 16) custom pixel hex colors or null for empty space */
+  pixels: (string | null)[];
+}
+
 export type HazardType =
   | 'dooring'
   | 'blind_car'
@@ -33,6 +43,15 @@ export interface CalloutEvent {
   tone: 'good' | 'warn' | 'danger';
 }
 
+export interface ForecastAlert {
+  id: number;
+  title: string;
+  detail: string;
+  dir: 'left' | 'right' | 'down' | 'up' | 'stop';
+  distanceM: number;
+  tone: 'amber' | 'rose' | 'sky';
+}
+
 export interface HudSnapshot {
   speedKmh: number;
   distanceM: number;
@@ -50,6 +69,7 @@ export interface HudSnapshot {
   zoneIndex: number;
   activeCallout: CalloutEvent | null;
   activeWarning: string | null;
+  activeForecast: ForecastAlert | null;
   nearMissCount: number;
   defensiveCount: number;
   hitCounts: Record<HazardType, number>;
@@ -70,6 +90,7 @@ export interface RunSummary {
   hitCounts: Record<HazardType, number>;
   encounterCounts: Record<HazardType, number>;
   lastFatalHazard: HazardType | null;
+  arrestedByPolice?: boolean;
 }
 
 export interface MobileInputState {

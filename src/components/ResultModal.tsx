@@ -32,16 +32,21 @@ export const ResultModal: React.FC<ResultModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-30 bg-slate-950/84 flex items-center justify-center p-4">
-      <div className="w-full max-w-3xl bg-slate-900 border border-white/12 rounded-2xl p-6 md:p-8 shadow-2xl max-h-[92vh] overflow-y-auto">
+    <div className="fixed inset-0 z-30 bg-slate-950/84 flex items-center justify-center p-3 sm:p-4">
+      <div className="w-full max-w-3xl bg-slate-900 border border-white/12 rounded-2xl p-4 sm:p-6 md:p-8 shadow-2xl max-h-[90dvh] overflow-y-auto touch-pan-y">
         {/* Header Summary */}
-        <div className="flex flex-wrap items-center justify-between gap-4 pb-5 border-b border-white/10">
-          <div>
+        <div className="flex flex-wrap items-center justify-between gap-3 sm:gap-4 pb-4 sm:pb-5 border-b border-white/10">
+          <div className="min-w-0">
             <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider mb-1">
               {summary.cleared ? (
                 <span className="text-emerald-400 inline-flex items-center gap-1.5">
                   <ShieldCheck className="w-4 h-4" />
                   안전 완주 성공
+                </span>
+              ) : summary.arrestedByPolice ? (
+                <span className="text-sky-300 inline-flex items-center gap-1.5">
+                  <AlertOctagon className="w-4 h-4 text-rose-400" />
+                  경찰 단속 적발 · 교통법규 위반
                 </span>
               ) : (
                 <span className="text-rose-400 inline-flex items-center gap-1.5">
@@ -50,51 +55,55 @@ export const ResultModal: React.FC<ResultModalProps> = ({
                 </span>
               )}
             </div>
-            <h2 className="text-2xl md:text-3xl font-black text-white">
-              {summary.cleared ? '목적지까지 안전하게 도착했습니다!' : '도로 위 위험 상황에 부딪혔습니다'}
+            <h2 className="text-xl sm:text-2xl md:text-3xl font-black text-white leading-snug">
+              {summary.cleared
+                ? '목적지까지 안전하게 도착했습니다!'
+                : summary.arrestedByPolice
+                ? '반복된 차도 침범으로 경찰에 단속되었습니다!'
+                : '도로 위 위험 상황에 부딪혔습니다'}
             </h2>
           </div>
 
-          <div className={`px-5 py-3 rounded-xl border text-center ${gradeColors[summary.grade]}`}>
-            <div className="text-xs font-bold opacity-85">안전 운전 등급</div>
-            <div className="font-display text-4xl font-bold leading-none mt-1">
+          <div className={`px-4 sm:px-5 py-2.5 sm:py-3 rounded-xl border text-center shrink-0 ${gradeColors[summary.grade]}`}>
+            <div className="text-[11px] sm:text-xs font-bold opacity-85">안전 운전 등급</div>
+            <div className="font-display text-3xl sm:text-4xl font-bold leading-none mt-1">
               {summary.grade}
             </div>
           </div>
         </div>
 
         {/* Quantitative Metrics Strip */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 my-5">
-          <div className="bg-slate-950/75 border border-white/8 rounded-xl p-3.5">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 sm:gap-3 my-4 sm:my-5">
+          <div className="bg-slate-950/75 border border-white/8 rounded-xl p-3 sm:p-3.5">
             <div className="text-xs text-slate-400">최종 점수</div>
-            <div className="font-mono-num text-xl font-bold text-white mt-0.5">
+            <div className="font-mono-num text-lg sm:text-xl font-bold text-white mt-0.5">
               {summary.score.toLocaleString()}
             </div>
             <div className="text-[11px] text-slate-500 font-mono-num mt-0.5">
               최고 {summary.bestScore.toLocaleString()}
             </div>
           </div>
-          <div className="bg-slate-950/75 border border-white/8 rounded-xl p-3.5">
+          <div className="bg-slate-950/75 border border-white/8 rounded-xl p-3 sm:p-3.5">
             <div className="text-xs text-slate-400">주행 거리</div>
-            <div className="font-mono-num text-xl font-bold text-sky-300 mt-0.5">
+            <div className="font-mono-num text-lg sm:text-xl font-bold text-sky-300 mt-0.5">
               {summary.distanceM}m
             </div>
             <div className="text-[11px] text-slate-500 mt-0.5">
               최대 콤보 {summary.maxCombo}
             </div>
           </div>
-          <div className="bg-slate-950/75 border border-white/8 rounded-xl p-3.5">
+          <div className="bg-slate-950/75 border border-white/8 rounded-xl p-3 sm:p-3.5">
             <div className="text-xs text-slate-400">방어운전 성공</div>
-            <div className="font-mono-num text-xl font-bold text-emerald-300 mt-0.5">
+            <div className="font-mono-num text-lg sm:text-xl font-bold text-emerald-300 mt-0.5">
               {summary.defensiveCount}회
             </div>
             <div className="text-[11px] text-slate-500 mt-0.5">
               감속·경적·정지선
             </div>
           </div>
-          <div className="bg-slate-950/75 border border-white/8 rounded-xl p-3.5">
+          <div className="bg-slate-950/75 border border-white/8 rounded-xl p-3 sm:p-3.5">
             <div className="text-xs text-slate-400">아슬아슬 회피</div>
-            <div className="font-mono-num text-xl font-bold text-amber-300 mt-0.5">
+            <div className="font-mono-num text-lg sm:text-xl font-bold text-amber-300 mt-0.5">
               {summary.nearMissCount}회
             </div>
             <div className="text-[11px] text-slate-500 mt-0.5">
@@ -104,36 +113,53 @@ export const ResultModal: React.FC<ResultModalProps> = ({
         </div>
 
         {/* Educational Real-World Safety Debriefing */}
-        <div className="mb-6">
-          <div className="flex items-center gap-2 text-sm font-bold text-white mb-3">
+        <div className="mb-5 sm:mb-6">
+          <div className="flex items-center gap-2 text-sm font-bold text-white mb-2.5 sm:mb-3">
             <Award className="w-4 h-4 text-amber-400" />
             <span>이번 주행 실제 사고 예방 리포트</span>
           </div>
 
-          {reportList.length === 0 ? (
-            <div className="bg-slate-950/60 border border-white/8 rounded-xl p-4 text-sm text-slate-300">
+          {summary.arrestedByPolice && (
+            <div className="bg-sky-950/45 border border-sky-400/45 rounded-xl p-3.5 sm:p-4 mb-3">
+              <div className="flex items-center justify-between gap-2 mb-1.5">
+                <span className="font-bold text-xs sm:text-sm text-white">
+                  자전거 전용도로 이탈 · 반복 차도 침범 단속
+                </span>
+                <span className="text-xs font-bold text-sky-300 shrink-0">경찰 적발</span>
+              </div>
+              <p className="text-xs text-slate-300 leading-relaxed mb-1.5">
+                <strong className="text-slate-100">위험 이유:</strong> 자전거 전용도로를 벗어나 자동차 차로로 반복 진입하면 대형 추돌 사고의 위험이 매우 높습니다.
+              </p>
+              <p className="text-xs text-amber-200 leading-relaxed">
+                <strong>예방 수칙:</strong> 자전거 전용도로(붉은 차선) 내에서 감속·조향·경적으로 위험을 피하고 차도를 침범하지 마세요.
+              </p>
+            </div>
+          )}
+
+          {reportList.length === 0 && !summary.arrestedByPolice ? (
+            <div className="bg-slate-950/60 border border-white/8 rounded-xl p-4 text-xs sm:text-sm text-slate-300">
               주행 중 큰 위험 상황 없이 안전하게 주행했습니다. 항상 전방을 주시하고 헬멧을 착용하세요!
             </div>
           ) : (
-            <div className="space-y-3">
+            <div className="space-y-2.5 sm:space-y-3">
               {reportList.map(({ type, hitCount }) => {
                 const lesson = SAFETY_LESSONS[type];
                 const isHit = hitCount > 0;
                 return (
                   <div
                     key={type}
-                    className={`rounded-xl p-4 border ${
+                    className={`rounded-xl p-3.5 sm:p-4 border ${
                       isHit
                         ? 'bg-rose-950/35 border-rose-500/40'
                         : 'bg-slate-950/65 border-white/10'
                     }`}
                   >
                     <div className="flex items-center justify-between gap-2 mb-1.5">
-                      <span className="font-bold text-sm text-white">
+                      <span className="font-bold text-xs sm:text-sm text-white">
                         {lesson.title}
                       </span>
                       <span
-                        className={`text-xs font-bold ${
+                        className={`text-xs font-bold shrink-0 ${
                           isHit ? 'text-rose-300' : 'text-emerald-300'
                         }`}
                       >
@@ -154,11 +180,11 @@ export const ResultModal: React.FC<ResultModalProps> = ({
         </div>
 
         {/* Actions */}
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-wrap items-center gap-2.5 sm:gap-3">
           <button
             type="button"
             onClick={onRetry}
-            className="flex-1 min-w-[160px] inline-flex items-center justify-center gap-2 px-6 py-3.5 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-black transition-colors cursor-pointer"
+            className="flex-1 min-w-[150px] inline-flex items-center justify-center gap-2 px-5 sm:px-6 py-3 sm:py-3.5 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-black text-sm sm:text-base transition-colors cursor-pointer"
           >
             <RotateCcw className="w-4 h-4" />
             <span>다시 도전하기</span>
@@ -166,7 +192,7 @@ export const ResultModal: React.FC<ResultModalProps> = ({
           <button
             type="button"
             onClick={onExitToTitle}
-            className="inline-flex items-center justify-center gap-2 px-6 py-3.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-bold transition-colors cursor-pointer"
+            className="inline-flex items-center justify-center gap-2 px-5 sm:px-6 py-3 sm:py-3.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-bold text-sm sm:text-base transition-colors cursor-pointer"
           >
             <Home className="w-4 h-4" />
             <span>코스 선택 화면</span>

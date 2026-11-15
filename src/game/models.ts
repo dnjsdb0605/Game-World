@@ -1,8 +1,12 @@
 import * as THREE from 'three';
+import { createVoxelBikeMesh } from './pixelBike';
+import type { BikeFrameStyle, BikeType } from './types';
 
 export interface PlayerBikeRig {
   root: THREE.Group;
   leanGroup: THREE.Group;
+  standardChassisGroup: THREE.Group;
+  customVoxelGroup: THREE.Group;
   frontWheel: THREE.Group;
   rearWheel: THREE.Group;
   forkGroup: THREE.Group;
@@ -12,6 +16,14 @@ export interface PlayerBikeRig {
   riderTorso: THREE.Group;
   tailLightMat: THREE.MeshStandardMaterial;
   headLightMat: THREE.MeshStandardMaterial;
+  frameMat: THREE.MeshPhysicalMaterial;
+  rimMat: THREE.MeshStandardMaterial;
+  basketGroup: THREE.Group;
+  rearRackGroup: THREE.Group;
+  frontBrakeGroup: THREE.Group;
+  rearBrakeGroup: THREE.Group;
+  brakeGlowMat: THREE.MeshStandardMaterial;
+  frameVariantGroups: Record<BikeFrameStyle, THREE.Group>;
   shieldBubble: THREE.Mesh;
   contactShadow: THREE.Mesh;
 }
@@ -22,6 +34,13 @@ export interface CarRig {
   hazardLeftMat: THREE.MeshStandardMaterial;
   hazardRightMat: THREE.MeshStandardMaterial;
   brakeMat: THREE.MeshStandardMaterial;
+  headlightBeam: THREE.Mesh;
+}
+
+export interface PoliceCarRig {
+  root: THREE.Group;
+  redStrobeMat: THREE.MeshStandardMaterial;
+  blueStrobeMat: THREE.MeshStandardMaterial;
   headlightBeam: THREE.Mesh;
 }
 
@@ -114,6 +133,18 @@ export function createPlayerBikeRig(contactShadowTex: THREE.Texture): PlayerBike
     metalness: 0.92,
     roughness: 0.16,
   });
+  const rimMat = new THREE.MeshStandardMaterial({
+    color: 0xe2e8f0,
+    metalness: 0.88,
+    roughness: 0.2,
+  });
+  const brakeGlowMat = new THREE.MeshStandardMaterial({
+    color: 0xf43f5e,
+    emissive: 0xf59e0b,
+    emissiveIntensity: 0.25,
+    metalness: 0.6,
+    roughness: 0.25,
+  });
   const tireMat = new THREE.MeshStandardMaterial({
     color: 0x14181f,
     metalness: 0.05,
@@ -151,18 +182,25 @@ export function createPlayerBikeRig(contactShadowTex: THREE.Texture): PlayerBike
   contactShadow.position.y = 0.02;
   root.add(contactShadow);
 
+  const standardChassisGroup = new THREE.Group();
+  leanGroup.add(standardChassisGroup);
+
+  const customVoxelGroup = new THREE.Group();
+  customVoxelGroup.visible = false;
+  leanGroup.add(customVoxelGroup);
+
   const wheelRadius = 0.34;
   // Rear wheel (+Z)
-  const rearWheel = createWheel(wheelRadius, tireMat, chromeMat, chromeMat);
+  const rearWheel = createWheel(wheelRadius, tireMat, rimMat, chromeMat);
   rearWheel.position.set(0, wheelRadius, 0.56);
-  leanGroup.add(rearWheel);
+  standardChassisGroup.add(rearWheel);
 
   // Front Fork & Steering Assembly (-Z)
   const forkGroup = new THREE.Group();
   forkGroup.position.set(0, wheelRadius, -0.56);
-  leanGroup.add(forkGroup);
+  standardChassisGroup.add(forkGroup);
 
-  const frontWheel = createWheel(wheelRadius, tireMat, chromeMat, chromeMat);
+  const frontWheel = createWheel(wheelRadius, tireMat, rimMat, chromeMat);
   forkGroup.add(frontWheel);
 
   // Fork tubes
@@ -202,48 +240,172 @@ export function createPlayerBikeRig(contactShadowTex: THREE.Texture): PlayerBike
   headlight.position.set(0, 0.57, 0.06);
   forkGroup.add(headlight);
 
-  // Main Diamond Frame Tubes (TubeGeometry / Cylinders)
-  const addTube = (p1: THREE.Vector3, p2: THREE.Vector3, r: number, mat: THREE.Material) => {
+  // Front Basket (for Ttareungi & Commuter bikes)
+  const basketGroup = new THREE.Group();
+  const basketMat = new THREE.MeshStandardMaterial({
+    color: 0x334155,
+    metalness: 0.6,
+    roughness: 0.45,
+    wireframe: true,
+  });
+  const basketBody = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.18, 0.2), basketMat);
+  basketBody.position.set(0, 0.49, -0.09);
+  basketGroup.add(basketBody);
+  const basketRim = new THREE.Mesh(new THREE.BoxGeometry(0.29, 0.02, 0.21), matteMetalMat);
+  basketRim.position.set(0, 0.58, -0.09);
+  basketGroup.add(basketRim);
+  forkGroup.add(basketGroup);
+
+  // Animated Front Brake Assembly (levers on handlebar + caliper on fork)
+  const frontBrakeGroup = new THREE.Group();
+  [-0.19, 0.19].forEach((bx) => {
+    const leverMount = new THREE.Mesh(new THREE.BoxGeometry(0.035, 0.035, 0.04), matteMetalMat);
+    leverMount.position.set(bx, 0.615, 0.095);
+    frontBrakeGroup.add(leverMount);
+
+    const leverBlade = new THREE.Mesh(new THREE.BoxGeometry(0.085, 0.018, 0.022), brakeGlowMat);
+    leverBlade.position.set(bx > 0 ? bx + 0.035 : bx - 0.035, 0.61, 0.07);
+    leverBlade.rotation.y = bx > 0 ? -0.28 : 0.28;
+    frontBrakeGroup.add(leverBlade);
+  });
+  const frontCaliper = new THREE.Mesh(new THREE.TorusGeometry(0.068, 0.015, 8, 16, Math.PI * 1.15), brakeGlowMat);
+  frontCaliper.rotation.z = -Math.PI * 0.08;
+  frontCaliper.position.set(0, 0.34, 0.02);
+  frontBrakeGroup.add(frontCaliper);
+  [-0.06, 0.06].forEach((px) => {
+    const pad = new THREE.Mesh(new THREE.BoxGeometry(0.024, 0.032, 0.045), brakeGlowMat);
+    pad.position.set(px, 0.32, 0.02);
+    frontBrakeGroup.add(pad);
+  });
+  forkGroup.add(frontBrakeGroup);
+
+  // Selectable 3D Frame Variants (Diamond, Step-Through, Track, Aero)
+  const addTubeTo = (
+    target: THREE.Group,
+    p1: THREE.Vector3,
+    p2: THREE.Vector3,
+    r: number,
+    mat: THREE.Material
+  ) => {
     const dist = p1.distanceTo(p2);
     const mesh = new THREE.Mesh(new THREE.CylinderGeometry(r, r, dist, 10), mat);
     mesh.position.copy(p1).add(p2).multiplyScalar(0.5);
     mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), p2.clone().sub(p1).normalize());
     mesh.castShadow = true;
-    leanGroup.add(mesh);
+    target.add(mesh);
+  };
+
+  const addTube = (p1: THREE.Vector3, p2: THREE.Vector3, r: number, mat: THREE.Material) => {
+    addTubeTo(standardChassisGroup, p1, p2, r, mat);
   };
 
   const bb = new THREE.Vector3(0, 0.3, 0.1); // bottom bracket
   const headTop = new THREE.Vector3(0, 0.78, -0.42);
   const headBot = new THREE.Vector3(0, 0.64, -0.46);
   const seatTop = new THREE.Vector3(0, 0.81, 0.18);
-  const rearAxle = new THREE.Vector3(0, 0.34, 0.56);
 
-  addTube(bb, headBot, 0.024, frameMat);
-  addTube(seatTop, headTop, 0.022, frameMat);
-  addTube(bb, seatTop, 0.022, frameMat);
-  addTube(headBot, headTop, 0.025, frameMat);
-  // Rear stays
-  addTube(new THREE.Vector3(0, 0.3, 0.1), new THREE.Vector3(-0.055, 0.34, 0.56), 0.013, frameMat);
-  addTube(new THREE.Vector3(0, 0.3, 0.1), new THREE.Vector3(0.055, 0.34, 0.56), 0.013, frameMat);
-  addTube(seatTop, new THREE.Vector3(-0.055, 0.34, 0.56), 0.012, frameMat);
-  addTube(seatTop, new THREE.Vector3(0.055, 0.34, 0.56), 0.012, frameMat);
+  const addRearStays = (target: THREE.Group, seatAnchor: THREE.Vector3) => {
+    addTubeTo(target, new THREE.Vector3(0, 0.3, 0.1), new THREE.Vector3(-0.055, 0.34, 0.56), 0.013, frameMat);
+    addTubeTo(target, new THREE.Vector3(0, 0.3, 0.1), new THREE.Vector3(0.055, 0.34, 0.56), 0.013, frameMat);
+    addTubeTo(target, seatAnchor, new THREE.Vector3(-0.055, 0.34, 0.56), 0.012, frameMat);
+    addTubeTo(target, seatAnchor, new THREE.Vector3(0.055, 0.34, 0.56), 0.012, frameMat);
+  };
+
+  // 1) Diamond (Standard commuter triangle)
+  const diamondGroup = new THREE.Group();
+  addTubeTo(diamondGroup, bb, headBot, 0.024, frameMat);
+  addTubeTo(diamondGroup, seatTop, headTop, 0.022, frameMat);
+  addTubeTo(diamondGroup, bb, seatTop, 0.022, frameMat);
+  addTubeTo(diamondGroup, headBot, headTop, 0.025, frameMat);
+  addRearStays(diamondGroup, seatTop);
+  standardChassisGroup.add(diamondGroup);
+
+  // 2) Step-Through (Curved low U-downtube, no high top bar)
+  const stepthroughGroup = new THREE.Group();
+  stepthroughGroup.visible = false;
+  const stepCurve = new THREE.QuadraticBezierCurve3(
+    headBot.clone(),
+    new THREE.Vector3(0, 0.32, -0.18),
+    bb.clone()
+  );
+  const stepTube = new THREE.Mesh(new THREE.TubeGeometry(stepCurve, 18, 0.029, 10, false), frameMat);
+  stepTube.castShadow = true;
+  stepthroughGroup.add(stepTube);
+  addTubeTo(stepthroughGroup, bb, seatTop, 0.023, frameMat);
+  addTubeTo(stepthroughGroup, headBot, headTop, 0.025, frameMat);
+  addRearStays(stepthroughGroup, seatTop);
+  standardChassisGroup.add(stepthroughGroup);
+
+  // 3) Track (Level horizontal pursuit top tube)
+  const trackGroup = new THREE.Group();
+  trackGroup.visible = false;
+  const trackSeatTop = new THREE.Vector3(0, 0.84, 0.17);
+  const trackHeadTop = new THREE.Vector3(0, 0.83, -0.41);
+  addTubeTo(trackGroup, bb, headBot, 0.023, frameMat);
+  addTubeTo(trackGroup, trackSeatTop, trackHeadTop, 0.022, frameMat);
+  addTubeTo(trackGroup, bb, trackSeatTop, 0.022, frameMat);
+  addTubeTo(trackGroup, headBot, trackHeadTop, 0.025, frameMat);
+  addRearStays(trackGroup, trackSeatTop);
+  standardChassisGroup.add(trackGroup);
+
+  // 4) Aero (Sloped bladed racing frame)
+  const aeroGroup = new THREE.Group();
+  aeroGroup.visible = false;
+  const aeroSeatTop = new THREE.Vector3(0, 0.77, 0.19);
+  addTubeTo(aeroGroup, bb, headBot, 0.032, frameMat);
+  addTubeTo(aeroGroup, aeroSeatTop, headTop, 0.025, frameMat);
+  addTubeTo(aeroGroup, bb, aeroSeatTop, 0.026, frameMat);
+  addTubeTo(aeroGroup, headBot, headTop, 0.027, frameMat);
+  addRearStays(aeroGroup, new THREE.Vector3(0, 0.72, 0.21));
+  standardChassisGroup.add(aeroGroup);
+
+  const frameVariantGroups: Record<BikeFrameStyle, THREE.Group> = {
+    diamond: diamondGroup,
+    stepthrough: stepthroughGroup,
+    track: trackGroup,
+    aero: aeroGroup,
+  };
+
+  // Rear Carrier Rack (shown on Normal / Ttareungi)
+  const rearRackGroup = new THREE.Group();
+  const rackDeck = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.022, 0.36), matteMetalMat);
+  rackDeck.position.set(0, 0.73, 0.52);
+  rearRackGroup.add(rackDeck);
+  [-0.07, 0.07].forEach((rx) => {
+    const stay = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.008, 0.4, 6), matteMetalMat);
+    stay.position.set(rx, 0.54, 0.56);
+    rearRackGroup.add(stay);
+  });
+  standardChassisGroup.add(rearRackGroup);
+
+  // Animated Rear Brake Assembly (caliper on rear stays)
+  const rearBrakeGroup = new THREE.Group();
+  const rearCaliper = new THREE.Mesh(new THREE.TorusGeometry(0.068, 0.015, 8, 16, Math.PI * 1.15), brakeGlowMat);
+  rearCaliper.position.set(0, 0.66, 0.43);
+  rearBrakeGroup.add(rearCaliper);
+  [-0.06, 0.06].forEach((px) => {
+    const pad = new THREE.Mesh(new THREE.BoxGeometry(0.024, 0.032, 0.045), brakeGlowMat);
+    pad.position.set(px, 0.64, 0.43);
+    rearBrakeGroup.add(pad);
+  });
+  standardChassisGroup.add(rearBrakeGroup);
 
   // Seatpost & Saddle
   addTube(seatTop, new THREE.Vector3(0, 0.94, 0.21), 0.016, chromeMat);
   const saddle = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.05, 0.25), saddleMat);
   saddle.position.set(0, 0.96, 0.22);
   saddle.castShadow = true;
-  leanGroup.add(saddle);
+  standardChassisGroup.add(saddle);
 
   // Rear safety taillight
   const tailLight = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.04, 0.03), tailLightMat);
   tailLight.position.set(0, 0.87, 0.25);
-  leanGroup.add(tailLight);
+  standardChassisGroup.add(tailLight);
 
   // Crankset
   const crankGroup = new THREE.Group();
   crankGroup.position.copy(bb);
-  leanGroup.add(crankGroup);
+  standardChassisGroup.add(crankGroup);
   const chainring = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 0.015, 16), chromeMat);
   chainring.rotation.z = Math.PI / 2;
   chainring.position.x = 0.04;
@@ -347,6 +509,8 @@ export function createPlayerBikeRig(contactShadowTex: THREE.Texture): PlayerBike
   return {
     root,
     leanGroup,
+    standardChassisGroup,
+    customVoxelGroup,
     frontWheel,
     rearWheel,
     forkGroup,
@@ -356,9 +520,93 @@ export function createPlayerBikeRig(contactShadowTex: THREE.Texture): PlayerBike
     riderTorso,
     tailLightMat,
     headLightMat,
+    frameMat,
+    rimMat,
+    basketGroup,
+    rearRackGroup,
+    frontBrakeGroup,
+    rearBrakeGroup,
+    brakeGlowMat,
+    frameVariantGroups,
     shieldBubble,
     contactShadow,
   };
+}
+
+export function applyBikeStyle(
+  rig: PlayerBikeRig,
+  bikeType: BikeType,
+  customPixels?: (string | null)[]
+): void {
+  if (bikeType === 'custom') {
+    rig.standardChassisGroup.visible = false;
+    rig.customVoxelGroup.visible = true;
+    rig.frameMat.color.setHex(0x38bdf8);
+    rig.frameMat.map = null;
+    rig.frameMat.needsUpdate = true;
+
+    while (rig.customVoxelGroup.children.length > 0) {
+      const child = rig.customVoxelGroup.children[0];
+      rig.customVoxelGroup.remove(child);
+      if ((child as THREE.Mesh).isMesh) {
+        const mesh = child as THREE.Mesh;
+        mesh.geometry?.dispose();
+        if (Array.isArray(mesh.material)) {
+          mesh.material.forEach((m) => m.dispose());
+        } else {
+          mesh.material?.dispose();
+        }
+      }
+    }
+    const voxelMesh = createVoxelBikeMesh(customPixels ?? []);
+    rig.customVoxelGroup.add(voxelMesh);
+    return;
+  }
+
+  rig.standardChassisGroup.visible = true;
+  rig.customVoxelGroup.visible = false;
+
+  const activeFrame: BikeFrameStyle =
+    bikeType === 'ttareungi'
+      ? 'stepthrough'
+      : bikeType === 'fixie'
+      ? 'track'
+      : bikeType === 'pro'
+      ? 'aero'
+      : 'diamond';
+
+  (Object.keys(rig.frameVariantGroups) as BikeFrameStyle[]).forEach((key) => {
+    rig.frameVariantGroups[key].visible = key === activeFrame;
+  });
+
+  if (bikeType === 'ttareungi') {
+    rig.frameMat.color.setHex(0x16a34a);
+    rig.frameMat.roughness = 0.28;
+    rig.rimMat.color.setHex(0xf1f5f9);
+    rig.basketGroup.visible = true;
+    rig.rearRackGroup.visible = true;
+  } else if (bikeType === 'fixie') {
+    rig.frameMat.color.setHex(0x0f172a);
+    rig.frameMat.roughness = 0.42;
+    rig.rimMat.color.setHex(0xe11d48);
+    rig.basketGroup.visible = false;
+    rig.rearRackGroup.visible = false;
+  } else if (bikeType === 'pro') {
+    rig.frameMat.color.setHex(0xd97706);
+    rig.frameMat.roughness = 0.16;
+    rig.rimMat.color.setHex(0xfacc15);
+    rig.basketGroup.visible = false;
+    rig.rearRackGroup.visible = false;
+  } else {
+    rig.frameMat.color.setHex(0x0284c7);
+    rig.frameMat.roughness = 0.22;
+    rig.rimMat.color.setHex(0xe2e8f0);
+    rig.basketGroup.visible = true;
+    rig.rearRackGroup.visible = true;
+  }
+
+  rig.frameMat.map = null;
+  rig.frameMat.needsUpdate = true;
 }
 
 export function createCarRig(colorHex: number, contactShadowTex: THREE.Texture): CarRig {
@@ -562,6 +810,88 @@ export function createCarRig(colorHex: number, contactShadowTex: THREE.Texture):
     hazardRightMat,
     brakeMat,
     headlightBeam,
+  };
+}
+
+export function createPoliceCarRig(contactShadowTex: THREE.Texture): PoliceCarRig {
+  const car = createCarRig(0xf8fafc, contactShadowTex);
+  const root = car.root;
+
+  // Korean police navy-blue hood, trunk & side patrol stripes
+  const navyMat = new THREE.MeshPhysicalMaterial({
+    color: 0x1e3a8a,
+    metalness: 0.5,
+    roughness: 0.28,
+    clearcoat: 0.8,
+  });
+  const goldAccentMat = new THREE.MeshStandardMaterial({
+    color: 0xfacc15,
+    emissive: 0xfacc15,
+    emissiveIntensity: 0.25,
+    roughness: 0.35,
+  });
+
+  const hoodPanel = new THREE.Mesh(new THREE.BoxGeometry(1.74, 0.06, 1.05), navyMat);
+  hoodPanel.position.set(0, 0.87, -1.48);
+  root.add(hoodPanel);
+
+  const trunkPanel = new THREE.Mesh(new THREE.BoxGeometry(1.74, 0.06, 0.85), navyMat);
+  trunkPanel.position.set(0, 0.87, 1.58);
+  root.add(trunkPanel);
+
+  [-0.94, 0.94].forEach((sx) => {
+    const sideStripe = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.22, 3.7), navyMat);
+    sideStripe.position.set(sx, 0.62, 0);
+    root.add(sideStripe);
+
+    const goldLine = new THREE.Mesh(new THREE.BoxGeometry(0.035, 0.06, 3.5), goldAccentMat);
+    goldLine.position.set(sx, 0.74, 0);
+    root.add(goldLine);
+  });
+
+  // Roof Police Lightbar (Red & Blue Strobes)
+  const barBase = new THREE.Mesh(
+    new THREE.BoxGeometry(1.18, 0.08, 0.28),
+    new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.5 })
+  );
+  barBase.position.set(0, 1.44, 0.12);
+  root.add(barBase);
+
+  const redStrobeMat = new THREE.MeshStandardMaterial({
+    color: 0xef4444,
+    emissive: 0xef4444,
+    emissiveIntensity: 2.8,
+    roughness: 0.15,
+  });
+  const blueStrobeMat = new THREE.MeshStandardMaterial({
+    color: 0x3b82f6,
+    emissive: 0x3b82f6,
+    emissiveIntensity: 0.2,
+    roughness: 0.15,
+  });
+
+  const redPod = new THREE.Mesh(new THREE.BoxGeometry(0.48, 0.12, 0.24), redStrobeMat);
+  redPod.position.set(-0.34, 1.5, 0.12);
+  root.add(redPod);
+
+  const centerPod = new THREE.Mesh(
+    new THREE.BoxGeometry(0.2, 0.12, 0.24),
+    new THREE.MeshStandardMaterial({ color: 0xf8fafc, emissive: 0xf8fafc, emissiveIntensity: 0.8 })
+  );
+  centerPod.position.set(0, 1.5, 0.12);
+  root.add(centerPod);
+
+  const bluePod = new THREE.Mesh(new THREE.BoxGeometry(0.48, 0.12, 0.24), blueStrobeMat);
+  bluePod.position.set(0.34, 1.5, 0.12);
+  root.add(bluePod);
+
+  car.headlightBeam.visible = true;
+
+  return {
+    root,
+    redStrobeMat,
+    blueStrobeMat,
+    headlightBeam: car.headlightBeam,
   };
 }
 
@@ -774,36 +1104,72 @@ export function createSignalGantry(): SignalGantryRig {
   const poleMat = new THREE.MeshStandardMaterial({ color: 0x475569, metalness: 0.65, roughness: 0.38 });
   const boxMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, metalness: 0.3, roughness: 0.55 });
 
-  // Pole on right sidewalk (+5.4) and arm spanning over the road
-  const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.18, 5.4, 10), poleMat);
-  pole.position.set(5.4, 2.7, 0);
+  // Pole on right sidewalk (+5.4) and arm spanning over both bike lane and car lanes
+  const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.2, 5.6, 10), poleMat);
+  pole.position.set(5.45, 2.8, 0);
   pole.castShadow = true;
   root.add(pole);
 
-  const arm = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.11, 8.8, 10), poleMat);
+  const arm = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.12, 9.6, 10), poleMat);
   arm.rotation.z = Math.PI / 2;
-  arm.position.set(1.1, 5.1, 0);
+  arm.position.set(0.75, 5.2, 0);
   root.add(arm);
 
-  // Horizontal 3-light traffic signal box facing +Z (approaching player)
-  const housing = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.55, 0.36), boxMat);
-  housing.position.set(1.2, 5.05, 0.22);
-  root.add(housing);
+  const redMat = new THREE.MeshStandardMaterial({
+    color: 0xef4444,
+    emissive: 0xef4444,
+    emissiveIntensity: 0.15,
+    roughness: 0.2,
+  });
+  const yellowMat = new THREE.MeshStandardMaterial({
+    color: 0xfacc15,
+    emissive: 0xfacc15,
+    emissiveIntensity: 0.15,
+    roughness: 0.2,
+  });
+  const greenMat = new THREE.MeshStandardMaterial({
+    color: 0x22c55e,
+    emissive: 0x22c55e,
+    emissiveIntensity: 1.8,
+    roughness: 0.2,
+  });
 
-  const redMat = new THREE.MeshStandardMaterial({ color: 0xef4444, emissive: 0xef4444, emissiveIntensity: 0.15, roughness: 0.2 });
-  const yellowMat = new THREE.MeshStandardMaterial({ color: 0xfacc15, emissive: 0xfacc15, emissiveIntensity: 0.15, roughness: 0.2 });
-  const greenMat = new THREE.MeshStandardMaterial({ color: 0x22c55e, emissive: 0x22c55e, emissiveIntensity: 1.6, roughness: 0.2 });
-
-  const lampGeo = new THREE.CylinderGeometry(0.16, 0.16, 0.08, 14);
+  const lampGeo = new THREE.CylinderGeometry(0.19, 0.19, 0.09, 14);
   lampGeo.rotateX(Math.PI / 2);
 
-  const redLamp = new THREE.Mesh(lampGeo, redMat);
-  redLamp.position.set(0.72, 5.05, 0.4);
-  const yellowLamp = new THREE.Mesh(lampGeo, yellowMat);
-  yellowLamp.position.set(1.2, 5.05, 0.4);
-  const greenLamp = new THREE.Mesh(lampGeo, greenMat);
-  greenLamp.position.set(1.68, 5.05, 0.4);
-  root.add(redLamp, yellowLamp, greenLamp);
+  // Two horizontal 3-light overhead housings (center vehicle lane + right bike lane)
+  [-0.3, 3.15].forEach((hx) => {
+    const housing = new THREE.Mesh(new THREE.BoxGeometry(1.9, 0.64, 0.4), boxMat);
+    housing.position.set(hx, 5.15, 0.22);
+    root.add(housing);
+
+    const visor = new THREE.Mesh(new THREE.BoxGeometry(1.94, 0.08, 0.22), boxMat);
+    visor.position.set(hx, 5.44, 0.44);
+    root.add(visor);
+
+    const redLamp = new THREE.Mesh(lampGeo, redMat);
+    redLamp.position.set(hx - 0.56, 5.15, 0.43);
+    const yellowLamp = new THREE.Mesh(lampGeo, yellowMat);
+    yellowLamp.position.set(hx, 5.15, 0.43);
+    const greenLamp = new THREE.Mesh(lampGeo, greenMat);
+    greenLamp.position.set(hx + 0.56, 5.15, 0.43);
+    root.add(redLamp, yellowLamp, greenLamp);
+  });
+
+  // Eye-level auxiliary vertical signal head on the right pole for cyclists
+  const auxBox = new THREE.Mesh(new THREE.BoxGeometry(0.46, 1.25, 0.3), boxMat);
+  auxBox.position.set(5.1, 2.75, 0.16);
+  root.add(auxBox);
+
+  const auxLampGeo = new THREE.CylinderGeometry(0.13, 0.13, 0.08, 12);
+  auxLampGeo.rotateX(Math.PI / 2);
+  const auxRed = new THREE.Mesh(auxLampGeo, redMat);
+  auxRed.position.set(5.1, 3.1, 0.32);
+  const auxYellow = new THREE.Mesh(auxLampGeo, yellowMat);
+  auxYellow.position.set(5.1, 2.75, 0.32);
+  const auxGreen = new THREE.Mesh(auxLampGeo, greenMat);
+  auxGreen.position.set(5.1, 2.4, 0.32);
+  root.add(auxRed, auxYellow, auxGreen);
 
   return { root, redMat, yellowMat, greenMat };
 }

@@ -5,7 +5,9 @@ import { ResultModal } from './components/ResultModal';
 import { TitleOverlay } from './components/TitleOverlay';
 import { soundEngine } from './game/audio';
 import { BikeSafetyEngine } from './game/BikeSafetyEngine';
+import { buildStarterPixelBike } from './game/pixelBike';
 import type {
+  BikeType,
   DifficultyMode,
   GamePhase,
   HudSnapshot,
@@ -30,6 +32,7 @@ const INITIAL_HUD: HudSnapshot = {
   zoneIndex: 1,
   activeCallout: null,
   activeWarning: null,
+  activeForecast: null,
   nearMissCount: 0,
   defensiveCount: 0,
   hitCounts: {
@@ -70,6 +73,11 @@ export default function App() {
 
   const [phase, setPhase] = useState<GamePhase>('title');
   const [mode, setMode] = useState<DifficultyMode>('city');
+  const [bikeType, setBikeType] = useState<BikeType>('normal');
+  const [customPixels, setCustomPixels] = useState<(string | null)[]>(() =>
+    buildStarterPixelBike('diamond')
+  );
+  const [showFixieModal, setShowFixieModal] = useState(false);
   const [hud, setHud] = useState<HudSnapshot>(INITIAL_HUD);
   const [summary, setSummary] = useState<RunSummary | null>(null);
   const [muted, setMuted] = useState(false);
@@ -91,6 +99,7 @@ export default function App() {
           window.clearTimeout(flashTimeout);
           flashTimeout = window.setTimeout(() => setCrashFlash(false), 220);
         },
+        onFixieBlocked: () => setShowFixieModal(true),
       });
       engineRef.current = engine;
 
@@ -121,10 +130,32 @@ export default function App() {
     engineRef.current?.setMode(nextMode);
   };
 
+  const handleSelectBike = (nextBike: BikeType) => {
+    setBikeType(nextBike);
+    if (nextBike !== 'fixie') {
+      setShowFixieModal(false);
+    }
+    engineRef.current?.setBikeType(nextBike, customPixels);
+  };
+
+  const handleChangeCustomPixels = (nextPixels: (string | null)[]) => {
+    setCustomPixels(nextPixels);
+    engineRef.current?.setCustomPixelBike(nextPixels);
+  };
+
+  const handleTitleModalVisibility = (open: boolean) => {
+    engineRef.current?.setTitleModalOpen(open);
+  };
+
   const handleStart = (selectedMode: DifficultyMode) => {
+    if (bikeType === 'fixie') {
+      setShowFixieModal(true);
+      engineRef.current?.startRun(selectedMode, 'fixie', customPixels);
+      return;
+    }
     setMode(selectedMode);
     setSummary(null);
-    engineRef.current?.startRun(selectedMode);
+    engineRef.current?.startRun(selectedMode, bikeType, customPixels);
   };
 
   const handleToggleMute = () => {
@@ -154,7 +185,7 @@ export default function App() {
   };
 
   return (
-    <main className="relative w-screen h-screen overflow-hidden bg-slate-950">
+    <main className="relative w-full h-dvh overflow-hidden bg-slate-950">
       {/* Isolated WebGL Viewport Container */}
       <div
         ref={canvasMountRef}
@@ -188,7 +219,14 @@ export default function App() {
       {phase === 'title' && (
         <TitleOverlay
           mode={mode}
+          bikeType={bikeType}
+          customPixels={customPixels}
+          showFixieModal={showFixieModal}
           onSelectMode={handleSelectMode}
+          onSelectBike={handleSelectBike}
+          onChangeCustomPixels={handleChangeCustomPixels}
+          onCloseFixieModal={() => setShowFixieModal(false)}
+          onModalVisibilityChange={handleTitleModalVisibility}
           onStart={handleStart}
           muted={muted}
           onToggleMute={handleToggleMute}

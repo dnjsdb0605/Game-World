@@ -7,6 +7,7 @@ import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { soundEngine } from './audio';
 import {
+  applyBikeStyle,
   createCarRig,
   createDogRig,
   createGravelGroup,
@@ -14,6 +15,7 @@ import {
   createPedestrianRig,
   createPickupGroup,
   createPlayerBikeRig,
+  createPoliceCarRig,
   createRoadworkGroup,
   createScooterRig,
   createSignalGantry,
@@ -24,6 +26,7 @@ import {
   type KidsRig,
   type PedestrianRig,
   type PlayerBikeRig,
+  type PoliceCarRig,
   type ScooterRig,
   type SignalGantryRig,
   type WrongWayBikeRig,
@@ -31,6 +34,7 @@ import {
 import {
   createBuildingFacadeTexture,
   createContactShadowTexture,
+  createDoorZoneTexture,
   createPotholeTexture,
   createPuddleTexture,
   createRoadNormalMap,
@@ -38,11 +42,15 @@ import {
   createRoadTexture,
   createSidewalkNormalMap,
   createSidewalkTexture,
+  createTrajectoryArrowTexture,
   createWarningChevronTexture,
 } from './textures';
+import { buildStarterPixelBike } from './pixelBike';
 import type {
+  BikeType,
   CalloutEvent,
   DifficultyMode,
+  ForecastAlert,
   GamePhase,
   HazardType,
   HudSnapshot,
@@ -57,7 +65,7 @@ const _vec3B = new THREE.Vector3();
 const SEGMENT_LEN = 36;
 const NUM_SEGMENTS = 5;
 const TOTAL_ROAD_LEN = SEGMENT_LEN * NUM_SEGMENTS;
-const ROAD_HALF_WIDTH = 4.25;
+const ROAD_HALF_WIDTH = 4.65;
 
 interface RoadSegment {
   group: THREE.Group;
@@ -87,6 +95,9 @@ interface ActiveHazard {
   kidsRig?: KidsRig;
   wrongBikeRig?: WrongWayBikeRig;
   warningMesh?: THREE.Mesh;
+  trajectoryMesh?: THREE.Mesh;
+  trajectoryOffsetZ?: number;
+  doorZoneMesh?: THREE.Mesh;
   doorOpenProgress: number;
   sideDir: number; // -1 or +1
   startX: number;
@@ -95,6 +106,8 @@ interface ActiveHazard {
   forwardSpeed: number;
   braking: boolean;
   signalState: 'green' | 'yellow' | 'red';
+  alwaysGreen?: boolean;
+  rearChase?: boolean;
   walkPhase: number;
 }
 
@@ -120,6 +133,7 @@ export interface EngineCallbacks {
   onGameOver: (summary: RunSummary) => void;
   onPhaseChange: (phase: GamePhase) => void;
   onCrashFlash: () => void;
+  onFixieBlocked?: () => void;
 }
 
 export class BikeSafetyEngine {
@@ -148,6 +162,8 @@ export class BikeSafetyEngine {
   private potholeTex!: THREE.CanvasTexture;
   private puddleTex!: THREE.CanvasTexture;
   private chevronTex!: THREE.CanvasTexture;
+  private trajectoryTex!: THREE.CanvasTexture;
+  private doorZoneTex!: THREE.CanvasTexture;
   private roadNormalTex!: THREE.CanvasTexture;
   private roadRoughnessTex!: THREE.CanvasTexture;
   private sidewalkTex!: THREE.CanvasTexture;
@@ -169,6 +185,11 @@ export class BikeSafetyEngine {
   // Game State
   private phase: GamePhase = 'title';
   private mode: DifficultyMode = 'city';
+  private bikeType: BikeType = 'normal';
+  private customPixels: (string | null)[] = buildStarterPixelBike('diamond');
+  private titleModalOpen = false;
+  private brakeInstallAnim = 1;
+  private brakeInstallBurstDone = true;
   private playerX = 3.2; // Start in the red Korean bike lane
   private playerVX = 0;
   private speed = 10.5; // m/s (~38 km/h max, cruising ~22-30 km/h)
@@ -198,9 +219,20 @@ export class BikeSafetyEngine {
   private readonly bellCooldownMax = 1.2;
   private slipTimer = 0;
   private wrongLaneTimer = 0;
+  private rearChaseWarned = false;
+  private carLaneIntrusionCount = 0;
+  private currentIntrusionCounted = false;
+  private policePursuitActive = false;
+  private policeArrestTimer = 0;
+  private policeRig: PoliceCarRig | null = null;
+  private policeZ = 14;
+  private policeX = 0.8;
+  private policeWhistlePlayed = false;
+  private arrestedByPolice = false;
 
   private nextSpawnZ = -48;
-  private nextTrafficZ = -32;
+  private nextTrafficZ = -26;
+  private nextSignalZ = -68;
   private hazardBag: HazardType[] = [];
   private hazardIdSeq = 1;
   private calloutIdSeq = 1;
@@ -468,6 +500,8 @@ export class BikeSafetyEngine {
     this.potholeTex = createPotholeTexture(maxAniso);
     this.puddleTex = createPuddleTexture(maxAniso);
     this.chevronTex = createWarningChevronTexture(maxAniso);
+    this.trajectoryTex = createTrajectoryArrowTexture(maxAniso);
+    this.doorZoneTex = createDoorZoneTexture(maxAniso);
     this.roadNormalTex = createRoadNormalMap(maxAniso);
     this.roadRoughnessTex = createRoadRoughnessMap(maxAniso);
     this.sidewalkTex = createSidewalkTexture(maxAniso);
@@ -686,6 +720,7 @@ export class BikeSafetyEngine {
 
   private buildPlayer(): void {
     this.bikeRig = createPlayerBikeRig(this.contactShadowTex);
+    applyBikeStyle(this.bikeRig, this.bikeType);
     this.bikeRig.root.position.set(this.playerX, 0, 0);
     this.scene.add(this.bikeRig.root);
 
@@ -795,7 +830,7 @@ export class BikeSafetyEngine {
     }
 
     if (this.phase === 'title') {
-      if (code === 'Enter' || code === 'Space') {
+      if (!this.titleModalOpen && (code === 'Enter' || code === 'Space')) {
         this.startRun(this.mode);
       }
       return;
@@ -863,6 +898,10 @@ export class BikeSafetyEngine {
             h.pedRig.alertMark.visible = true;
             h.pedRig.phoneGlow.visible = false;
           }
+          if (h.trajectoryMesh) {
+            h.trajectoryMesh.rotation.z = 0;
+            (h.trajectoryMesh.material as THREE.MeshBasicMaterial).color.setHex(0x22c55e);
+          }
           if (!h.defensiveAwarded) {
             h.defensiveAwarded = true;
             this.defensiveCount++;
@@ -873,6 +912,10 @@ export class BikeSafetyEngine {
           h.alertedByBell = true;
           h.targetX = 4.85;
           if (h.kidsRig) h.kidsRig.alertMark.visible = true;
+          if (h.trajectoryMesh) {
+            h.trajectoryMesh.rotation.z = 0;
+            (h.trajectoryMesh.material as THREE.MeshBasicMaterial).color.setHex(0x22c55e);
+          }
           if (!h.defensiveAwarded) {
             h.defensiveAwarded = true;
             this.defensiveCount++;
@@ -883,6 +926,10 @@ export class BikeSafetyEngine {
           h.alertedByBell = true;
           h.targetX = 4.8;
           if (h.dogRig) h.dogRig.alertMark.visible = true;
+          if (h.trajectoryMesh) {
+            h.trajectoryMesh.rotation.z = 0;
+            (h.trajectoryMesh.material as THREE.MeshBasicMaterial).color.setHex(0x22c55e);
+          }
           if (!h.defensiveAwarded) {
             h.defensiveAwarded = true;
             this.defensiveCount++;
@@ -901,7 +948,54 @@ export class BikeSafetyEngine {
     this.mode = mode;
   }
 
-  public startRun(mode: DifficultyMode): void {
+  public setTitleModalOpen(open: boolean): void {
+    this.titleModalOpen = open;
+  }
+
+  public setBikeType(bikeType: BikeType, pixels?: (string | null)[]): void {
+    this.bikeType = bikeType;
+    if (pixels) {
+      this.customPixels = pixels;
+    }
+
+    if (this.bikeRig) {
+      applyBikeStyle(this.bikeRig, bikeType, this.customPixels);
+      if (bikeType === 'fixie') {
+        this.brakeInstallAnim = 0;
+        this.brakeInstallBurstDone = false;
+        this.bikeRig.brakeGlowMat.emissiveIntensity = 2.6;
+        this.bikeRig.frontBrakeGroup.position.set(0, 0.48, -0.14);
+        this.bikeRig.rearBrakeGroup.position.set(0, 0.42, 0.12);
+      } else {
+        this.brakeInstallAnim = 1;
+        this.brakeInstallBurstDone = true;
+        this.bikeRig.brakeGlowMat.emissiveIntensity = 0.25;
+        this.bikeRig.frontBrakeGroup.position.set(0, 0, 0);
+        this.bikeRig.rearBrakeGroup.position.set(0, 0, 0);
+        this.bikeRig.frontBrakeGroup.scale.setScalar(1);
+        this.bikeRig.rearBrakeGroup.scale.setScalar(1);
+      }
+    }
+  }
+
+  public setCustomPixelBike(pixels: (string | null)[]): void {
+    this.customPixels = pixels;
+    if (this.bikeRig && this.bikeType === 'custom') {
+      applyBikeStyle(this.bikeRig, 'custom', pixels);
+    }
+  }
+
+  public startRun(mode: DifficultyMode, bikeType?: BikeType, pixels?: (string | null)[]): void {
+    if (bikeType && (pixels || bikeType !== this.bikeType)) {
+      this.setBikeType(bikeType, pixels);
+    }
+    if (this.bikeType === 'fixie') {
+      soundEngine.unlock();
+      soundEngine.playCarHorn();
+      this.callbacks.onFixieBlocked?.();
+      return;
+    }
+
     soundEngine.unlock();
     this.mode = mode;
     this.clearEntities();
@@ -925,8 +1019,16 @@ export class BikeSafetyEngine {
     this.bellCooldown = 0;
     this.slipTimer = 0;
     this.wrongLaneTimer = 0;
+    this.rearChaseWarned = false;
+    this.carLaneIntrusionCount = 0;
+    this.currentIntrusionCounted = false;
+    this.policePursuitActive = false;
+    this.policeArrestTimer = 0;
+    this.policeWhistlePlayed = false;
+    this.arrestedByPolice = false;
     this.nextSpawnZ = -44;
-    this.nextTrafficZ = -34;
+    this.nextTrafficZ = -24;
+    this.nextSignalZ = -68;
     this.hazardBag = [];
     this.activeCallout = null;
     this.activeWarning = null;
@@ -983,12 +1085,45 @@ export class BikeSafetyEngine {
     for (const h of this.hazards) {
       this.scene.remove(h.group);
       if (h.warningMesh) this.scene.remove(h.warningMesh);
+      if (h.trajectoryMesh) this.scene.remove(h.trajectoryMesh);
+      if (h.doorZoneMesh) this.scene.remove(h.doorZoneMesh);
     }
     this.hazards = [];
     for (const p of this.pickups) {
       this.scene.remove(p.group);
     }
     this.pickups = [];
+    if (this.policeRig) {
+      this.scene.remove(this.policeRig.root);
+      this.policeRig = null;
+    }
+  }
+
+  private createTrajectoryMesh(
+    length: number,
+    width: number,
+    colorHex: number,
+    rotZ: number,
+    x: number,
+    z: number
+  ): THREE.Mesh {
+    const mesh = new THREE.Mesh(
+      new THREE.PlaneGeometry(length, width),
+      new THREE.MeshBasicMaterial({
+        map: this.trajectoryTex,
+        color: colorHex,
+        transparent: true,
+        opacity: 0.85,
+        depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: -2,
+        polygonOffsetUnits: -2,
+      })
+    );
+    mesh.rotation.set(-Math.PI / 2, 0, rotZ);
+    mesh.position.set(x, 0.048, z);
+    this.scene.add(mesh);
+    return mesh;
   }
 
   private getTargetDistance(): number | null {
@@ -1072,6 +1207,7 @@ export class BikeSafetyEngine {
   private update(dt: number): void {
     this.elapsed += dt;
     this.puddleUniformTime.value = this.elapsed;
+    this.trajectoryTex.offset.x -= dt * 1.9;
     this.skyDomeMat.uniforms.uTime.value = this.elapsed;
     this.skyDomeMesh.position.set(this.playerX, 0, -24);
 
@@ -1123,6 +1259,34 @@ export class BikeSafetyEngine {
     this.crankAngle -= cruiseSpeed * dt * 1.25;
     this.animateBikeRig(0, 0);
 
+    // Animate fixie brake installation motion smoothly onto fork & handlebar
+    if (this.brakeInstallAnim < 1) {
+      this.brakeInstallAnim = Math.min(1, this.brakeInstallAnim + dt * 0.92);
+      const t = this.brakeInstallAnim;
+      const ease = 1 - Math.pow(1 - t, 3);
+      const lift = (1 - ease) * 0.48;
+      const pulseScale = 1 + Math.sin(t * Math.PI) * 0.26;
+      this.bikeRig.frontBrakeGroup.position.set(0, lift, -(1 - ease) * 0.14);
+      this.bikeRig.rearBrakeGroup.position.set(0, lift * 0.88, (1 - ease) * 0.12);
+      this.bikeRig.frontBrakeGroup.scale.setScalar(pulseScale);
+      this.bikeRig.rearBrakeGroup.scale.setScalar(pulseScale);
+      this.bikeRig.brakeGlowMat.emissiveIntensity = 1.6 + Math.sin(this.elapsed * 18) * 1.2;
+
+      if (t >= 1 && !this.brakeInstallBurstDone) {
+        this.brakeInstallBurstDone = true;
+        this.bikeRig.frontBrakeGroup.position.set(0, 0, 0);
+        this.bikeRig.rearBrakeGroup.position.set(0, 0, 0);
+        this.bikeRig.frontBrakeGroup.scale.setScalar(1);
+        this.bikeRig.rearBrakeGroup.scale.setScalar(1);
+        this.bikeRig.brakeGlowMat.emissiveIntensity = 0.6;
+        this.spawnBurst(this.playerX, 0.95, -0.45, 0x38bdf8, 12, 3.4);
+        this.spawnBurst(this.playerX, 0.72, 0.45, 0xfacc15, 10, 3.0);
+        soundEngine.playPickup();
+      }
+    }
+
+    this.updateParticles(dt);
+
     // Sweeping GTA-style camera pan behind and around the cyclist
     const angle = Math.sin(this.elapsed * 0.35) * 0.42;
     _vec3A.set(
@@ -1168,22 +1332,35 @@ export class BikeSafetyEngine {
   }
 
   private updatePlayer(dt: number): void {
+    if (this.policePursuitActive) {
+      this.updatePolicePursuit(dt);
+      return;
+    }
+
     const left = this.heldKeys.has('KeyA') || this.heldKeys.has('ArrowLeft') || this.mobileInput.left;
     const right = this.heldKeys.has('KeyD') || this.heldKeys.has('ArrowRight') || this.mobileInput.right;
     const accel = this.heldKeys.has('KeyW') || this.heldKeys.has('ArrowUp') || this.mobileInput.accel;
     const brake = this.heldKeys.has('KeyS') || this.heldKeys.has('ArrowDown') || this.mobileInput.brake;
 
-    // Difficulty speed ramp
+    // Check if an active yellow/red traffic light stop-line is ahead
+    const nearSignalStop = this.hazards.some((h) => {
+      if (h.type !== 'red_signal' || h.alwaysGreen || h.defensiveAwarded || h.hit) return false;
+      const stopLineWorldZ = h.z + 4.6;
+      return stopLineWorldZ > -22 && stopLineWorldZ <= 1.8;
+    });
+
+    // Difficulty speed ramp + selected bike handling character
+    const bikeSpeedMul = this.bikeType === 'pro' ? 1.07 : this.bikeType === 'ttareungi' ? 0.95 : 1.0;
     const zoneFactor = Math.min(this.distanceM / 1400, 1);
-    const baseCruise = (this.mode === 'school' ? 9.2 : 10.6) + zoneFactor * 3.2;
-    const maxSpeed = baseCruise + 4.4;
-    const minSpeed = 2.6;
+    const baseCruise = ((this.mode === 'school' ? 9.2 : 10.6) + zoneFactor * 3.2) * bikeSpeedMul;
+    const maxSpeed = baseCruise + (this.bikeType === 'pro' ? 5.0 : 4.4);
+    const minSpeed = nearSignalStop ? 0.35 : 1.2;
 
     let targetSpeed = baseCruise;
     if (accel) targetSpeed = maxSpeed;
     if (brake) targetSpeed = minSpeed;
 
-    const accelRate = brake ? 9.5 : accel ? 4.2 : 2.8;
+    const accelRate = brake ? 13.5 : accel ? (this.bikeType === 'pro' ? 4.9 : 4.2) : 2.8;
     this.speed = THREE.MathUtils.damp(this.speed, targetSpeed, accelRate, dt);
 
     // Brake light & brake audio
@@ -1196,14 +1373,56 @@ export class BikeSafetyEngine {
 
     if (this.slipTimer > 0) this.slipTimer = Math.max(0, this.slipTimer - dt);
 
-    // Warn when riding on wrong/oncoming left side of yellow double line
-    if (this.playerX < -1.1) {
+    // Track car-lane encroachments (repeated violations dispatch police; 3s continuous triggers rear-end car)
+    if (this.playerX < 1.95) {
       this.wrongLaneTimer += dt;
-      if (this.wrongLaneTimer > 0.55 && !this.activeWarning) {
-        this.pushWarning('중앙선 침범! 역주행 차량 충돌 위험 (우측 자전거 도로 복귀)', 1.0);
+      if (this.wrongLaneTimer >= 0.65 && !this.currentIntrusionCounted) {
+        this.currentIntrusionCounted = true;
+        this.carLaneIntrusionCount++;
+        if (this.carLaneIntrusionCount === 1) {
+          this.pushWarning('차도 침범 주의! (1/3회) 우측 붉은 자전거 도로로 복귀하세요', 1.2);
+        } else if (this.carLaneIntrusionCount === 2) {
+          soundEngine.playCarHorn();
+          this.pushWarning('차도 반복 침범 경고! (2/3회) 재침범 시 경찰이 출동합니다!', 1.5);
+        } else if (this.carLaneIntrusionCount >= 3) {
+          this.startPolicePursuit();
+          return;
+        }
+      }
+
+      if (this.wrongLaneTimer >= 3.0) {
+        const activeChaseExists = this.hazards.some((h) => h.rearChase && h.z > -4 && !h.hit);
+        if (!activeChaseExists && this.invulnTimer <= 0) {
+          this.spawnRearChaseCar();
+        }
+        this.wrongLaneTimer = 0;
+        this.rearChaseWarned = false;
+      } else if (this.wrongLaneTimer >= 2.0) {
+        if (!this.rearChaseWarned) {
+          this.rearChaseWarned = true;
+          soundEngine.playCarHorn();
+        }
+        const remain = Math.max(0.1, 3.0 - this.wrongLaneTimer).toFixed(1);
+        this.pushWarning(
+          this.playerX < -1.1
+            ? `중앙선 침범! ${remain}초 후 차량 충돌 — 자전거 도로로 복귀!`
+            : `후방 차량 접근! ${remain}초 안에 우측 자전거 도로로 피하세요!`,
+          0.35
+        );
+      } else if (this.wrongLaneTimer > 0.45 && !this.activeWarning) {
+        this.pushWarning(
+          this.playerX < -1.1
+            ? '중앙선 침범! 역주행 차량 충돌 위험 (자전거 도로 복귀)'
+            : '차도 주행 위험! 3초 이상 달리면 뒤차가 추돌합니다',
+          0.9
+        );
       }
     } else {
       this.wrongLaneTimer = 0;
+      this.rearChaseWarned = false;
+      if (this.playerX >= 2.0) {
+        this.currentIntrusionCounted = false;
+      }
     }
 
     // Lateral steering (responsive, analog-smooth counter-lean, with wet/gravel slip wobble)
@@ -1215,10 +1434,14 @@ export class BikeSafetyEngine {
     this.playerX += this.playerVX * dt;
     this.playerX = THREE.MathUtils.clamp(this.playerX, -ROAD_HALF_WIDTH, ROAD_HALF_WIDTH);
 
-    // Distance & continuous riding score
+    // Distance & continuous riding score (higher reward for staying inside the dedicated bike lane)
     const deltaDist = this.speed * dt;
     this.distanceM += deltaDist;
-    const scoreMult = (this.doubleScoreTimer > 0 ? 2 : 1) * (1 + Math.min(this.combo, 8) * 0.1);
+    const laneSafetyMult = this.playerX >= 2.0 ? 1.25 : 0.7;
+    const scoreMult =
+      (this.doubleScoreTimer > 0 ? 2 : 1) *
+      (1 + Math.min(this.combo, 8) * 0.1) *
+      laneSafetyMult;
     this.score += deltaDist * 4.5 * scoreMult;
 
     // Bike kinematics & invulnerability blink
@@ -1257,6 +1480,11 @@ export class BikeSafetyEngine {
     this.bikeRig.leftLegPivot.rotation.x = Math.sin(this.crankAngle) * 0.42 - 0.12;
     this.bikeRig.rightLegPivot.rotation.x = Math.sin(this.crankAngle + Math.PI) * 0.42 - 0.12;
     this.bikeRig.riderTorso.rotation.z = lean * 0.35;
+    if (this.bikeType === 'custom') {
+      this.bikeRig.customVoxelGroup.position.y = Math.abs(Math.sin(this.crankAngle)) * 0.016;
+    } else {
+      this.bikeRig.customVoxelGroup.position.y = 0;
+    }
   }
 
   private scrollWorld(dt: number): void {
@@ -1264,6 +1492,7 @@ export class BikeSafetyEngine {
     this.scrollSegmentsOnly(dz);
     this.nextSpawnZ += dz;
     this.nextTrafficZ += dz;
+    this.nextSignalZ += dz;
   }
 
   private scrollSegmentsOnly(dz: number): void {
@@ -1277,48 +1506,155 @@ export class BikeSafetyEngine {
   }
 
   private spawnSystem(): void {
+    // Dedicated signalized intersections on the road every 78~98m so traffic lights are a core road rule
+    while (this.nextSignalZ > -128) {
+      const signalGap = this.mode === 'school' ? 82 + Math.random() * 18 : 92 + Math.random() * 22;
+      this.spawnTrafficSignal(this.nextSignalZ);
+      this.nextSignalZ -= signalGap;
+    }
+
     while (this.nextSpawnZ > -118) {
       const gap = this.mode === 'school'
         ? 24 + Math.random() * 8
         : Math.max(16.5, 23 - (this.distanceM / 1500) * 5) + Math.random() * 7;
       this.nextSpawnZ -= gap;
-      this.spawnHazardCluster(this.nextSpawnZ);
-
-      if (Math.random() < 0.4) {
-        this.spawnPickup(this.nextSpawnZ - gap * 0.45);
+      // Leave clear braking approach before/after traffic signal stop lines
+      const nearSignal = this.hazards.some(
+        (h) => h.type === 'red_signal' && Math.abs(h.z - this.nextSpawnZ) < 14
+      );
+      if (!nearSignal) {
+        this.spawnHazardCluster(this.nextSpawnZ);
+        if (Math.random() < 0.4) {
+          this.spawnPickup(this.nextSpawnZ - gap * 0.45);
+        }
       }
     }
 
-    // Spawn moving road traffic in car lanes so player cannot cheese by riding in empty car lanes
+    // Spawn moving road traffic steadily across right-forward, center-forward, and oncoming car lanes
     while (this.nextTrafficZ > -125) {
       const trafficGap = this.mode === 'school'
-        ? 28 + Math.random() * 14
-        : Math.max(18, 26 - (this.distanceM / 1600) * 6) + Math.random() * 10;
+        ? 19 + Math.random() * 9
+        : Math.max(14, 19 - (this.distanceM / 1600) * 4) + Math.random() * 7;
       this.nextTrafficZ -= trafficGap;
       this.spawnTrafficCar(this.nextTrafficZ);
     }
   }
 
-  private spawnTrafficCar(z: number): void {
-    // Check if there is a red_signal or bike-lane hazard nearby so we always keep a fair escape route
-    const nearbyHazard = this.hazards.some(
-      (h) => h.type !== 'traffic_car' && Math.abs(h.z - z) < 12.5
-    );
-    const oncoming = Math.random() < 0.46;
-    // If center-right lane (+0.55) would pinch a bike-lane hazard at the exact same Z, shift to oncoming lane (-2.65)
-    const useOncoming = oncoming || nearbyHazard;
+  private spawnTrafficSignal(z: number): void {
+    const id = this.hazardIdSeq++;
+    const alwaysGreen = Math.random() < 0.28;
+    if (!alwaysGreen) {
+      this.encounterCounts.red_signal++;
+    }
 
+    const signalRig = createSignalGantry();
+    signalRig.root.position.set(0, 0, z);
+    this.scene.add(signalRig.root);
+
+    // Local zebra crosswalk stripes just under/ahead of gantry (local z = 1.8)
+    const stripeMat = new THREE.MeshBasicMaterial({ color: 0xf1f5f9 });
+    for (let sx = -3.8; sx <= 3.85; sx += 0.95) {
+      const stripe = new THREE.Mesh(new THREE.PlaneGeometry(0.52, 2.3), stripeMat);
+      stripe.rotation.x = -Math.PI / 2;
+      stripe.position.set(sx, 0.036, 1.8);
+      signalRig.root.add(stripe);
+    }
+
+    // Crisp white stop line 4.6m in front of gantry (local coords!)
+    const stopLine = new THREE.Mesh(
+      new THREE.PlaneGeometry(9.6, 0.6),
+      new THREE.MeshBasicMaterial({ color: 0xf8fafc })
+    );
+    stopLine.rotation.x = -Math.PI / 2;
+    stopLine.position.set(0, 0.042, 4.6);
+    signalRig.root.add(stopLine);
+
+    this.hazards.push({
+      id,
+      type: 'red_signal',
+      group: signalRig.root,
+      x: 0,
+      z,
+      width: 10.4,
+      depth: 1.0,
+      height: 5.0,
+      passed: false,
+      hit: false,
+      nearMissAwarded: false,
+      defensiveAwarded: false,
+      signalRig,
+      doorOpenProgress: 0,
+      sideDir: 0,
+      startX: 0,
+      targetX: 0,
+      alertedByBell: false,
+      forwardSpeed: 0,
+      braking: false,
+      signalState: 'green',
+      alwaysGreen,
+      walkPhase: 0,
+    });
+  }
+
+  private spawnTrafficCar(z: number): void {
+    // Avoid spawning a car right on top of a crosswalk/signal gantry
+    const nearSignal = this.hazards.some(
+      (h) => h.type === 'red_signal' && Math.abs(h.z - z) < 9
+    );
+    if (nearSignal) return;
+
+    // 48% right-forward car lane (x = +1.15, directly adjacent to red bike lane x >= 2.15),
+    // 24% center-forward car lane (x = -0.38), 28% oncoming lane (x = -2.95)
+    const laneRoll = Math.random();
+    const candidates: { x: number; oncoming: boolean }[] =
+      laneRoll < 0.48
+        ? [
+            { x: 1.15, oncoming: false },
+            { x: -0.38, oncoming: false },
+            { x: -2.95, oncoming: true },
+          ]
+        : laneRoll < 0.72
+        ? [
+            { x: -0.38, oncoming: false },
+            { x: 1.15, oncoming: false },
+            { x: -2.95, oncoming: true },
+          ]
+        : [
+            { x: -2.95, oncoming: true },
+            { x: 1.15, oncoming: false },
+            { x: -0.38, oncoming: false },
+          ];
+
+    const chosen = candidates.find(
+      (c) =>
+        !this.hazards.some(
+          (h) => h.type === 'traffic_car' && Math.abs(h.x - c.x) < 1.1 && Math.abs(h.z - z) < 18
+        )
+    );
+    if (!chosen) return;
+
+    const useOncoming = chosen.oncoming;
+    const x = chosen.x;
     const carColors = [0x94a3b8, 0x1e293b, 0x3b82f6, 0x0f766e, 0xe2e8f0, 0x7c2d12];
     const id = this.hazardIdSeq++;
     const carRig = createCarRig(carColors[id % carColors.length], this.contactShadowTex);
 
-    const x = useOncoming ? -2.65 : 0.55;
     carRig.root.position.set(x, 0, z);
     if (useOncoming) {
       carRig.root.rotation.y = Math.PI; // Faces +Z oncoming toward player!
     }
     this.scene.add(carRig.root);
     this.encounterCounts.traffic_car++;
+
+    const trajectoryOffsetZ = useOncoming ? 4.4 : -4.4;
+    const trajectoryMesh = this.createTrajectoryMesh(
+      4.2,
+      1.05,
+      useOncoming ? 0xfb7185 : 0x38bdf8,
+      useOncoming ? -Math.PI / 2 : Math.PI / 2,
+      x,
+      z + trajectoryOffsetZ
+    );
 
     this.hazards.push({
       id,
@@ -1334,16 +1670,118 @@ export class BikeSafetyEngine {
       nearMissAwarded: false,
       defensiveAwarded: false,
       carRig,
+      trajectoryMesh,
+      trajectoryOffsetZ,
       doorOpenProgress: 0,
       sideDir: useOncoming ? -1 : 1,
       startX: x,
       targetX: x,
       alertedByBell: false,
-      forwardSpeed: useOncoming ? -(10.5 + Math.random() * 3.5) : 7.4 + Math.random() * 2.4,
+      forwardSpeed: useOncoming ? -(10.5 + Math.random() * 3.2) : 6.2 + Math.random() * 2.4,
       braking: false,
       signalState: 'green',
       walkPhase: 0,
     });
+  }
+
+  private spawnRearChaseCar(): void {
+    const id = this.hazardIdSeq++;
+    const carRig = createCarRig(0xdc2626, this.contactShadowTex);
+    const x = THREE.MathUtils.clamp(this.playerX, -3.6, 1.18);
+    const z = 11.5; // Starts behind camera (+4.35) and speeds into rear of bicycle
+    carRig.root.position.set(x, 0, z);
+    carRig.headlightBeam.visible = true;
+    this.scene.add(carRig.root);
+    this.encounterCounts.traffic_car++;
+
+    soundEngine.playCarHorn();
+    this.pushWarning('뒤에서 차가 달려옵니다! 즉시 붉은 자전거 도로로 피하세요!', 1.6);
+
+    this.hazards.push({
+      id,
+      type: 'traffic_car',
+      group: carRig.root,
+      x,
+      z,
+      width: 1.9,
+      depth: 4.2,
+      height: 1.5,
+      passed: false,
+      hit: false,
+      nearMissAwarded: false,
+      defensiveAwarded: false,
+      carRig,
+      doorOpenProgress: 0,
+      sideDir: 1,
+      startX: x,
+      targetX: x,
+      alertedByBell: false,
+      forwardSpeed: this.speed + 16.5,
+      braking: true,
+      signalState: 'green',
+      rearChase: true,
+      walkPhase: 0,
+    });
+  }
+
+  private startPolicePursuit(): void {
+    if (this.policePursuitActive) return;
+    this.policePursuitActive = true;
+    this.policeArrestTimer = 0;
+    this.policeWhistlePlayed = false;
+    this.policeZ = 10.5;
+    this.policeX = THREE.MathUtils.clamp(this.playerX - 0.9, -3.2, 1.35);
+
+    this.policeRig = createPoliceCarRig(this.contactShadowTex);
+    this.policeRig.root.position.set(this.policeX, 0, this.policeZ);
+    this.scene.add(this.policeRig.root);
+
+    soundEngine.playPoliceSiren();
+    this.pushWarning('경찰 단속 출동! 반복된 차도 침범으로 정지 명령!', 1.8);
+    this.pushCallout('경찰 단속 적발!', 0, 'danger');
+  }
+
+  private updatePolicePursuit(dt: number): void {
+    this.policeArrestTimer += dt;
+    // Rapidly pull bike over & brake to 0
+    this.speed = THREE.MathUtils.damp(this.speed, 0, 4.8, dt);
+    this.bikeRig.tailLightMat.emissiveIntensity = 3.2;
+
+    const deltaDist = this.speed * dt;
+    this.distanceM += deltaDist;
+    this.wheelAngle -= deltaDist / 0.34;
+    this.crankAngle -= deltaDist * 1.25;
+    this.leanAngle = THREE.MathUtils.damp(this.leanAngle, 0.05, 8, dt);
+    this.steerVisual = THREE.MathUtils.damp(this.steerVisual, 0.08, 8, dt);
+    this.playerX = THREE.MathUtils.damp(this.playerX, 2.35, 2.8, dt);
+    this.bikeRig.root.position.set(this.playerX, 0, 0);
+    this.animateBikeRig(this.leanAngle, this.steerVisual);
+    soundEngine.updateRollingSound((this.speed - 1) / 14, true, this.speed > 0.6);
+
+    if (this.policeRig) {
+      // Police cruiser pulls up alongside & cuts slightly ahead to intercept the cyclist
+      this.policeZ = THREE.MathUtils.damp(this.policeZ, -2.5, 4.2, dt);
+      const interceptX = this.policeZ > 0.5 ? this.playerX - 1.45 : this.playerX - 0.55;
+      this.policeX = THREE.MathUtils.damp(this.policeX, interceptX, 4.6, dt);
+      this.policeRig.root.position.set(this.policeX, 0, this.policeZ);
+      this.policeRig.root.rotation.y = this.policeZ < 0.2 ? -0.34 : 0.06;
+
+      // Vivid alternating red & blue strobe flash
+      const redPhase = Math.floor(this.elapsed * 12) % 2 === 0;
+      this.policeRig.redStrobeMat.emissiveIntensity = redPhase ? 3.5 : 0.15;
+      this.policeRig.blueStrobeMat.emissiveIntensity = redPhase ? 0.15 : 3.5;
+    }
+
+    if (!this.policeWhistlePlayed && this.policeArrestTimer >= 0.85) {
+      this.policeWhistlePlayed = true;
+      soundEngine.playPoliceWhistle();
+      this.pushWarning('단속 완료! 차도 반복 침범으로 주행이 종료됩니다', 1.2);
+    }
+
+    if (this.policeArrestTimer >= 1.7) {
+      this.arrestedByPolice = true;
+      this.finishRun(false);
+    }
   }
 
   private pullNextHazardType(): HazardType {
@@ -1353,8 +1791,8 @@ export class BikeSafetyEngine {
         zone === 1
           ? ['pet', 'kids', 'puddle', 'gravel', 'smombie', 'wrong_way_bike', 'dooring', 'pothole']
           : zone === 2
-          ? ['pet', 'kids', 'wrong_way_bike', 'puddle', 'gravel', 'blind_car', 'smombie', 'red_signal', 'pothole', 'dooring', 'roadwork']
-          : ['pet', 'kids', 'wrong_way_bike', 'puddle', 'gravel', 'blind_car', 'smombie', 'red_signal', 'scooter', 'pothole', 'roadwork', 'dooring'];
+          ? ['pet', 'kids', 'wrong_way_bike', 'puddle', 'gravel', 'blind_car', 'smombie', 'pothole', 'dooring', 'roadwork']
+          : ['pet', 'kids', 'wrong_way_bike', 'puddle', 'gravel', 'blind_car', 'smombie', 'scooter', 'pothole', 'roadwork', 'dooring'];
 
       // Fisher-Yates shuffle so dooring never repeats back-to-back and all hazards appear evenly
       const bag = [...basePool];
@@ -1375,16 +1813,35 @@ export class BikeSafetyEngine {
     if (type === 'dooring') {
       const carColors = [0xe2e8f0, 0x334155, 0x475569, 0x1d4ed8, 0xb91c1c];
       const carRig = createCarRig(carColors[id % carColors.length], this.contactShadowTex);
-      const x = 4.35; // Parked along right curb/bike lane edge
+      const x = 4.55; // Parked tightly along right curb so cyclists can evade inside the bike lane!
       carRig.root.position.set(x, 0, z);
       this.scene.add(carRig.root);
+
+      const doorZoneMesh = new THREE.Mesh(
+        new THREE.PlaneGeometry(1.15, 3.4),
+        new THREE.MeshBasicMaterial({
+          map: this.doorZoneTex,
+          transparent: true,
+          opacity: 0.9,
+          depthWrite: false,
+          polygonOffset: true,
+          polygonOffsetFactor: -1,
+          polygonOffsetUnits: -1,
+        })
+      );
+      doorZoneMesh.rotation.x = -Math.PI / 2;
+      doorZoneMesh.position.set(x - 1.45, 0.042, z);
+      this.scene.add(doorZoneMesh);
+
+      const trajectoryMesh = this.createTrajectoryMesh(1.75, 0.65, 0xfbbf24, Math.PI, x - 1.55, z);
+
       this.hazards.push({
         id,
         type,
         group: carRig.root,
         x,
         z,
-        width: 1.9,
+        width: 1.85,
         depth: 4.2,
         height: 1.5,
         passed: false,
@@ -1392,6 +1849,9 @@ export class BikeSafetyEngine {
         nearMissAwarded: false,
         defensiveAwarded: false,
         carRig,
+        trajectoryMesh,
+        trajectoryOffsetZ: 0,
+        doorZoneMesh,
         doorOpenProgress: 0,
         sideDir: -1,
         startX: x,
@@ -1404,9 +1864,9 @@ export class BikeSafetyEngine {
       });
     } else if (type === 'blind_car') {
       const carRig = createCarRig(0xf8fafc, this.contactShadowTex);
-      const fromRight = Math.random() > 0.4;
+      const fromRight = Math.random() > 0.35;
       const startX = fromRight ? 7.6 : -7.6;
-      const targetX = fromRight ? 1.55 : -1.45;
+      const targetX = fromRight ? 4.2 : -2.6;
       carRig.root.position.set(startX, 0, z);
       carRig.root.rotation.y = fromRight ? Math.PI / 2 : -Math.PI / 2;
       carRig.headlightBeam.visible = true;
@@ -1414,7 +1874,7 @@ export class BikeSafetyEngine {
 
       // Ground warning chevron decal on road ahead of emerging car
       const warningMesh = new THREE.Mesh(
-        new THREE.PlaneGeometry(2.8, 2.8),
+        new THREE.PlaneGeometry(2.4, 2.4),
         new THREE.MeshBasicMaterial({
           map: this.chevronTex,
           transparent: true,
@@ -1424,8 +1884,17 @@ export class BikeSafetyEngine {
       );
       warningMesh.rotation.x = -Math.PI / 2;
       warningMesh.rotation.z = fromRight ? Math.PI : 0;
-      warningMesh.position.set(fromRight ? 3.1 : -3.1, 0.04, z);
+      warningMesh.position.set(fromRight ? 3.8 : -3.5, 0.04, z);
       this.scene.add(warningMesh);
+
+      const trajectoryMesh = this.createTrajectoryMesh(
+        3.4,
+        0.95,
+        0xf97316,
+        fromRight ? Math.PI : 0,
+        fromRight ? 3.4 : -2.8,
+        z
+      );
 
       this.hazards.push({
         id,
@@ -1433,7 +1902,7 @@ export class BikeSafetyEngine {
         group: carRig.root,
         x: startX,
         z,
-        width: 3.6,
+        width: 3.4,
         depth: 1.9,
         height: 1.5,
         passed: false,
@@ -1442,6 +1911,8 @@ export class BikeSafetyEngine {
         defensiveAwarded: false,
         carRig,
         warningMesh,
+        trajectoryMesh,
+        trajectoryOffsetZ: 0,
         doorOpenProgress: 0,
         sideDir: fromRight ? -1 : 1,
         startX,
@@ -1455,24 +1926,36 @@ export class BikeSafetyEngine {
     } else if (type === 'smombie') {
       const shirtColors = [0xec4899, 0x8b5cf6, 0x06b6d4, 0x10b981];
       const pedRig = createPedestrianRig(shirtColors[id % shirtColors.length], this.contactShadowTex);
-      const startX = 4.25;
-      const targetX = 2.6 + Math.random() * 0.9; // Wanders into the red bike lane!
+      const startX = 4.55;
+      const targetX = 3.55 + Math.random() * 0.55; // Walks into right half of bike lane, leaving left half passable
       pedRig.root.position.set(startX, 0, z);
       this.scene.add(pedRig.root);
+
+      const trajectoryMesh = this.createTrajectoryMesh(
+        2.1,
+        0.65,
+        0xfacc15,
+        Math.PI,
+        (startX + targetX) * 0.5,
+        z
+      );
+
       this.hazards.push({
         id,
         type,
         group: pedRig.root,
         x: startX,
         z,
-        width: 0.75,
-        depth: 0.75,
+        width: 0.72,
+        depth: 0.72,
         height: 1.65,
         passed: false,
         hit: false,
         nearMissAwarded: false,
         defensiveAwarded: false,
         pedRig,
+        trajectoryMesh,
+        trajectoryOffsetZ: 0,
         doorOpenProgress: 0,
         sideDir: -1,
         startX,
@@ -1485,9 +1968,9 @@ export class BikeSafetyEngine {
       });
     } else if (type === 'pothole') {
       const group = new THREE.Group();
-      const x = [3.25, 0.7, -2.2][id % 3];
+      const x = [4.0, 2.75, 3.85][id % 3];
       const grate = new THREE.Mesh(
-        new THREE.PlaneGeometry(1.5, 1.5),
+        new THREE.PlaneGeometry(1.25, 1.25),
         new THREE.MeshStandardMaterial({
           map: this.potholeTex,
           roughness: 0.7,
@@ -1508,8 +1991,8 @@ export class BikeSafetyEngine {
         group,
         x,
         z,
-        width: 1.35,
-        depth: 1.35,
+        width: 1.15,
+        depth: 1.15,
         height: 0.25,
         passed: false,
         hit: false,
@@ -1527,7 +2010,8 @@ export class BikeSafetyEngine {
       });
     } else if (type === 'roadwork') {
       const group = createRoadworkGroup();
-      const x = [3.15, 0.7, -2.1][id % 3];
+      group.scale.set(0.78, 1, 1);
+      const x = [4.0, 2.75, 3.9][id % 3];
       group.position.set(x, 0, z);
       this.scene.add(group);
       this.hazards.push({
@@ -1536,7 +2020,7 @@ export class BikeSafetyEngine {
         group,
         x,
         z,
-        width: 1.75,
+        width: 1.25,
         depth: 0.65,
         height: 0.68,
         passed: false,
@@ -1555,16 +2039,25 @@ export class BikeSafetyEngine {
       });
     } else if (type === 'scooter') {
       const scooterRig = createScooterRig(this.contactShadowTex);
-      const x = Math.random() > 0.45 ? 0.75 : 3.2;
+      const x = Math.random() > 0.45 ? 3.85 : 2.8;
       scooterRig.root.position.set(x, 0, z);
       this.scene.add(scooterRig.root);
+      const trajectoryOffsetZ = -2.6;
+      const trajectoryMesh = this.createTrajectoryMesh(
+        2.6,
+        0.65,
+        0x38bdf8,
+        Math.PI / 2,
+        x,
+        z + trajectoryOffsetZ
+      );
       this.hazards.push({
         id,
         type,
         group: scooterRig.root,
         x,
         z,
-        width: 0.95,
+        width: 0.9,
         depth: 1.85,
         height: 1.4,
         passed: false,
@@ -1572,6 +2065,8 @@ export class BikeSafetyEngine {
         nearMissAwarded: false,
         defensiveAwarded: false,
         scooterRig,
+        trajectoryMesh,
+        trajectoryOffsetZ,
         doorOpenProgress: 0,
         sideDir: 0,
         startX: x,
@@ -1582,57 +2077,27 @@ export class BikeSafetyEngine {
         signalState: 'green',
         walkPhase: 0,
       });
-    } else if (type === 'red_signal') {
-      const signalRig = createSignalGantry();
-      signalRig.root.position.set(0, 0, z);
-      this.scene.add(signalRig.root);
-
-      // White stop line bar on road at z + 4.5
-      const stopLine = new THREE.Mesh(
-        new THREE.PlaneGeometry(9.6, 0.55),
-        new THREE.MeshBasicMaterial({ color: 0xf8fafc })
-      );
-      stopLine.rotation.x = -Math.PI / 2;
-      stopLine.position.set(0, 0.04, z + 4.8);
-      signalRig.root.add(stopLine);
-
-      this.hazards.push({
-        id,
-        type,
-        group: signalRig.root,
-        x: 0,
-        z,
-        width: 10.4,
-        depth: 1.0,
-        height: 5.0,
-        passed: false,
-        hit: false,
-        nearMissAwarded: false,
-        defensiveAwarded: false,
-        signalRig,
-        doorOpenProgress: 0,
-        sideDir: 0,
-        startX: 0,
-        targetX: 0,
-        alertedByBell: false,
-        forwardSpeed: 0,
-        braking: false,
-        signalState: 'green',
-        walkPhase: 0,
-      });
     } else if (type === 'pet') {
       const dogRig = createDogRig(this.contactShadowTex);
       const startX = 5.3;
-      const targetX = 2.6 + Math.random() * 0.9;
+      const targetX = 3.55 + Math.random() * 0.5;
       dogRig.root.position.set(startX, 0, z);
       this.scene.add(dogRig.root);
+      const trajectoryMesh = this.createTrajectoryMesh(
+        2.3,
+        0.65,
+        0xfb7185,
+        Math.PI,
+        (startX + targetX) * 0.5,
+        z
+      );
       this.hazards.push({
         id,
         type,
         group: dogRig.root,
         x: startX,
         z,
-        width: 0.9,
+        width: 0.85,
         depth: 0.65,
         height: 0.72,
         passed: false,
@@ -1640,6 +2105,8 @@ export class BikeSafetyEngine {
         nearMissAwarded: false,
         defensiveAwarded: false,
         dogRig,
+        trajectoryMesh,
+        trajectoryOffsetZ: 0,
         doorOpenProgress: 0,
         sideDir: -1,
         startX,
@@ -1652,17 +2119,25 @@ export class BikeSafetyEngine {
       });
     } else if (type === 'kids') {
       const kidsRig = createKidsGroup(this.contactShadowTex);
-      const startX = 4.1;
-      const targetX = 2.6 + Math.random() * 0.85;
+      const startX = 4.55;
+      const targetX = 3.55 + Math.random() * 0.5;
       kidsRig.root.position.set(startX, 0, z);
       this.scene.add(kidsRig.root);
+      const trajectoryMesh = this.createTrajectoryMesh(
+        2.0,
+        0.65,
+        0xfacc15,
+        Math.PI,
+        (startX + targetX) * 0.5,
+        z
+      );
       this.hazards.push({
         id,
         type,
         group: kidsRig.root,
         x: startX,
         z,
-        width: 1.25,
+        width: 1.05,
         depth: 0.85,
         height: 1.35,
         passed: false,
@@ -1670,6 +2145,8 @@ export class BikeSafetyEngine {
         nearMissAwarded: false,
         defensiveAwarded: false,
         kidsRig,
+        trajectoryMesh,
+        trajectoryOffsetZ: 0,
         doorOpenProgress: 0,
         sideDir: -1,
         startX,
@@ -1682,16 +2159,25 @@ export class BikeSafetyEngine {
       });
     } else if (type === 'wrong_way_bike') {
       const wrongBikeRig = createWrongWayBikeRig(this.contactShadowTex);
-      const x = 3.25;
+      const x = id % 2 === 0 ? 3.85 : 2.85;
       wrongBikeRig.root.position.set(x, 0, z);
       this.scene.add(wrongBikeRig.root);
+      const trajectoryOffsetZ = 2.9;
+      const trajectoryMesh = this.createTrajectoryMesh(
+        3.6,
+        0.75,
+        0xf43f5e,
+        -Math.PI / 2,
+        x,
+        z + trajectoryOffsetZ
+      );
       this.hazards.push({
         id,
         type,
         group: wrongBikeRig.root,
         x,
         z,
-        width: 0.72,
+        width: 0.7,
         depth: 1.7,
         height: 1.5,
         passed: false,
@@ -1699,6 +2185,8 @@ export class BikeSafetyEngine {
         nearMissAwarded: false,
         defensiveAwarded: false,
         wrongBikeRig,
+        trajectoryMesh,
+        trajectoryOffsetZ,
         doorOpenProgress: 0,
         sideDir: 0,
         startX: x,
@@ -1711,7 +2199,7 @@ export class BikeSafetyEngine {
       });
     } else if (type === 'puddle') {
       const group = new THREE.Group();
-      const x = [3.2, 2.5, 0.7][id % 3];
+      const x = [3.95, 2.75, 3.85][id % 3];
       const puddleMat = new THREE.MeshPhysicalMaterial({
         map: this.puddleTex,
         transparent: true,
@@ -1750,7 +2238,7 @@ export class BikeSafetyEngine {
         );
       };
       const puddleMesh = new THREE.Mesh(
-        new THREE.PlaneGeometry(1.9, 2.2),
+        new THREE.PlaneGeometry(1.45, 1.9),
         puddleMat
       );
       puddleMesh.rotation.x = -Math.PI / 2;
@@ -1764,8 +2252,8 @@ export class BikeSafetyEngine {
         group,
         x,
         z,
-        width: 1.55,
-        depth: 1.85,
+        width: 1.2,
+        depth: 1.6,
         height: 0.22,
         passed: false,
         hit: false,
@@ -1783,7 +2271,8 @@ export class BikeSafetyEngine {
       });
     } else if (type === 'gravel') {
       const group = createGravelGroup();
-      const x = [3.25, 2.4, 3.6][id % 3];
+      group.scale.set(0.82, 1, 0.9);
+      const x = [3.95, 2.7, 3.8][id % 3];
       group.position.set(x, 0, z);
       this.scene.add(group);
       this.hazards.push({
@@ -1792,8 +2281,8 @@ export class BikeSafetyEngine {
         group,
         x,
         z,
-        width: 1.45,
-        depth: 1.45,
+        width: 1.15,
+        depth: 1.25,
         height: 0.24,
         passed: false,
         hit: false,
@@ -1816,7 +2305,7 @@ export class BikeSafetyEngine {
     const roll = Math.random();
     const kind: 'shield' | 'double' | 'star' = roll < 0.25 ? 'shield' : roll < 0.5 ? 'double' : 'star';
     const group = createPickupGroup(kind);
-    const lanes = [-2.1, 0.7, 3.25];
+    const lanes = [2.55, 3.35, 4.15];
     const x = lanes[Math.floor(Math.random() * lanes.length)];
     group.position.set(x, 0, z);
     this.scene.add(group);
@@ -1835,6 +2324,15 @@ export class BikeSafetyEngine {
         h.warningMesh.position.z = h.z;
         (h.warningMesh.material as THREE.MeshBasicMaterial).opacity = blinkOn ? 0.92 : 0.35;
       }
+      if (h.trajectoryMesh) {
+        h.trajectoryMesh.position.z = h.z + (h.trajectoryOffsetZ ?? 0);
+        const pulse = 0.65 + 0.28 * Math.sin(this.elapsed * 8 + h.id);
+        (h.trajectoryMesh.material as THREE.MeshBasicMaterial).opacity = pulse;
+      }
+      if (h.doorZoneMesh) {
+        h.doorZoneMesh.position.z = h.z;
+        (h.doorZoneMesh.material as THREE.MeshBasicMaterial).opacity = blinkOn ? 0.92 : 0.55;
+      }
 
       // 1. Update hazard-specific telegraphs & kinematics
       if (h.type === 'dooring' && h.carRig) {
@@ -1842,21 +2340,13 @@ export class BikeSafetyEngine {
           h.carRig.hazardLeftMat.emissiveIntensity = blinkOn ? 2.4 : 0.2;
           h.carRig.hazardRightMat.emissiveIntensity = blinkOn ? 2.4 : 0.2;
         }
-        if (h.z > -40 && h.z < -25 && !this.activeWarning) {
-          this.pushWarning('주차 차량 비상등 점멸! 문 열림 주의 (안전거리 1m 확보)', 1.1);
-        }
         if (h.z > -24) {
           h.doorOpenProgress = Math.min(1, h.doorOpenProgress + dt * 3.8);
           h.carRig.doorPivot.rotation.y = -1.25 * h.doorOpenProgress;
         }
       } else if (h.type === 'blind_car' && h.carRig) {
-        if (h.z > -48 && h.z < -30) {
-          if (!this.activeWarning) {
-            this.pushWarning('골목 사각지대 차량 접근! S키로 감속하세요', 1.2);
-          }
-          if (Math.abs(h.z + 38) < 0.8) {
-            soundEngine.playCarHorn();
-          }
+        if (h.z > -48 && h.z < -30 && Math.abs(h.z + 38) < 0.8) {
+          soundEngine.playCarHorn();
         }
         if (h.z > -32) {
           h.x = THREE.MathUtils.damp(h.x, h.targetX, 3.4, dt);
@@ -1877,9 +2367,6 @@ export class BikeSafetyEngine {
           h.x = THREE.MathUtils.damp(h.x, h.targetX, 6.0, dt);
         } else if (h.z > -30) {
           h.x = THREE.MathUtils.damp(h.x, h.targetX, 2.2, dt);
-          if (h.z < -16 && !this.activeWarning) {
-            this.pushWarning('전방 스마트폰 보행자! E키(경적) 또는 우회하세요', 1.1);
-          }
         }
         h.group.position.x = h.x;
       } else if (h.type === 'scooter' && h.scooterRig) {
@@ -1889,35 +2376,53 @@ export class BikeSafetyEngine {
           h.braking = true;
           h.forwardSpeed = 1.6; // abrupt brake!
           h.scooterRig.brakeMat.emissiveIntensity = 3.2;
-          if (!this.activeWarning) {
-            this.pushWarning('전방 오토바이 급정거! 브레이크 또는 차로 변경', 1.1);
+          if (h.trajectoryMesh) {
+            (h.trajectoryMesh.material as THREE.MeshBasicMaterial).color.setHex(0xf43f5e);
           }
         }
       } else if (h.type === 'red_signal' && h.signalRig) {
-        if (h.z > -42 && h.z <= -28) {
-          h.signalState = 'yellow';
-          h.signalRig.greenMat.emissiveIntensity = 0.1;
-          h.signalRig.yellowMat.emissiveIntensity = 2.0;
-          if (!this.activeWarning) {
-            this.pushWarning('황색 신호! 정지선 앞에 감속하세요 (S키)', 1.2);
-          }
-        } else if (h.z > -28 && !h.defensiveAwarded) {
-          h.signalState = 'red';
+        const stopLineWorldZ = h.z + 4.6;
+        const brakeHeld =
+          this.heldKeys.has('KeyS') ||
+          this.heldKeys.has('ArrowDown') ||
+          this.mobileInput.brake;
+        if (h.alwaysGreen) {
+          h.signalState = 'green';
+          h.signalRig.redMat.emissiveIntensity = 0.1;
           h.signalRig.yellowMat.emissiveIntensity = 0.1;
-          h.signalRig.redMat.emissiveIntensity = 2.4;
-          if (!this.activeWarning) {
-            this.pushWarning('적색 신호! 정지선 앞에서 감속 정지하세요 (S키)', 1.2);
-          }
-        }
-        // Check if player slowed before stop line (z between -9 and +2)
-        if (h.signalState === 'red' && !h.defensiveAwarded && h.z > -9 && h.z < 1) {
-          if (this.speed <= 3.9) {
+          h.signalRig.greenMat.emissiveIntensity = 2.0;
+          if (!h.defensiveAwarded && stopLineWorldZ > 0.6) {
             h.defensiveAwarded = true;
-            h.signalState = 'green';
-            h.signalRig.redMat.emissiveIntensity = 0.1;
-            h.signalRig.greenMat.emissiveIntensity = 2.0;
-            this.defensiveCount++;
-            this.awardBonus('신호 · 정지선 준수!', 240, 'good');
+            this.awardBonus('초록 신호 안전 통과!', 80, 'good');
+          }
+        } else {
+          if (stopLineWorldZ > -54 && stopLineWorldZ <= -32 && !h.defensiveAwarded) {
+            h.signalState = 'yellow';
+            h.signalRig.greenMat.emissiveIntensity = 0.1;
+            h.signalRig.yellowMat.emissiveIntensity = 2.2;
+          } else if (stopLineWorldZ > -32 && !h.defensiveAwarded) {
+            h.signalState = 'red';
+            h.signalRig.yellowMat.emissiveIntensity = 0.1;
+            h.signalRig.redMat.emissiveIntensity = 2.5;
+          }
+          // Check if player slowed/stopped before the white stop line (stopLineWorldZ in [-11.0, 1.5])
+          const touchBrakeHeld = this.mobileInput.brake;
+          const safeStopSpeedLimit = touchBrakeHeld ? 7.5 : brakeHeld ? 6.8 : 5.2;
+          if (
+            h.signalState === 'red' &&
+            !h.defensiveAwarded &&
+            stopLineWorldZ > -11.0 &&
+            stopLineWorldZ <= 1.5
+          ) {
+            if (this.speed <= safeStopSpeedLimit) {
+              h.defensiveAwarded = true;
+              h.signalState = 'green';
+              h.signalRig.redMat.emissiveIntensity = 0.1;
+              h.signalRig.greenMat.emissiveIntensity = 2.0;
+              this.defensiveCount++;
+              soundEngine.playPickup();
+              this.awardBonus('신호 · 정지선 준수!', 240, 'good');
+            }
           }
         }
       } else if (h.type === 'pet' && h.dogRig) {
@@ -1932,9 +2437,6 @@ export class BikeSafetyEngine {
           if (!h.braking) {
             h.braking = true;
             soundEngine.playDogBark();
-            if (!this.activeWarning) {
-              this.pushWarning('전방 애완동물 돌진! 감속(S) 또는 경적(E)으로 멈추세요', 1.2);
-            }
           }
           h.x = THREE.MathUtils.damp(h.x, h.targetX, 3.8, dt);
         }
@@ -1948,21 +2450,31 @@ export class BikeSafetyEngine {
           h.x = THREE.MathUtils.damp(h.x, h.targetX, 6.0, dt);
         } else if (h.z > -32) {
           h.x = THREE.MathUtils.damp(h.x, h.targetX + Math.sin(this.elapsed * 3.5) * 0.25, 2.4, dt);
-          if (h.z < -16 && !this.activeWarning) {
-            this.pushWarning('전방 어린이 보행! 서행 및 경적(E)으로 알리세요', 1.2);
-          }
         }
         h.group.position.x = h.x;
       } else if (h.type === 'wrong_way_bike' && h.wrongBikeRig) {
         const spin = Math.abs(h.forwardSpeed) * dt / 0.33;
         h.wrongBikeRig.frontWheel.rotation.x -= spin;
         h.wrongBikeRig.rearWheel.rotation.x -= spin;
-        if (h.z > -44 && h.z < -22 && !this.activeWarning) {
-          this.pushWarning('전방 역주행 자전거 접근! 속도를 줄이고 안전하게 피하세요', 1.2);
-        }
       } else if (h.type === 'traffic_car') {
-        // Sound horn if oncoming car is close and player is in its lane
-        if (h.sideDir < 0 && h.z > -32 && h.z < -16 && Math.abs(this.playerX - h.x) < 1.35 && !h.braking) {
+        if (h.rearChase && h.carRig) {
+          // Rapidly close from behind while staying strictly within car lanes (<= 1.18)
+          h.forwardSpeed = this.speed + 16.5;
+          if (h.z > 0.4) {
+            const targetChaseX = THREE.MathUtils.clamp(this.playerX, -3.6, 1.18);
+            h.x = THREE.MathUtils.damp(h.x, targetChaseX, 7.5, dt);
+            h.group.position.x = h.x;
+          }
+          h.carRig.hazardLeftMat.emissiveIntensity = blinkOn ? 2.8 : 0.2;
+          h.carRig.hazardRightMat.emissiveIntensity = blinkOn ? 2.8 : 0.2;
+        } else if (
+          h.sideDir < 0 &&
+          h.z > -32 &&
+          h.z < -16 &&
+          Math.abs(this.playerX - h.x) < 1.35 &&
+          !h.braking
+        ) {
+          // Sound horn if oncoming car is close and player is in its lane
           h.braking = true;
           soundEngine.playCarHorn();
         }
@@ -1971,9 +2483,21 @@ export class BikeSafetyEngine {
       // 2. Collision & Near-Miss Detection around z ≈ 0 (bike length -0.8 to +0.8)
       if (!h.hit) {
         if (h.type === 'red_signal') {
-          if (h.signalState === 'red' && h.z > -0.6 && h.z < 1.2 && !h.defensiveAwarded) {
+          const stopLineWorldZ = h.z + 4.6;
+          const brakeHeld =
+            this.heldKeys.has('KeyS') ||
+            this.heldKeys.has('ArrowDown') ||
+            this.mobileInput.brake;
+          if (
+            !h.alwaysGreen &&
+            h.signalState === 'red' &&
+            stopLineWorldZ > 1.6 &&
+            stopLineWorldZ < 3.0 &&
+            !h.defensiveAwarded &&
+            (!brakeHeld || this.speed > 7.5)
+          ) {
             h.hit = true;
-            this.onHazardHit(h, '적색 신호 위반! 교차로 진입 전 정지하세요');
+            this.onHazardHit(h, '적색 신호 위반! 흰색 정지선 앞에서 정지하세요');
           }
         } else {
           // Determine effective hazard X bounds
@@ -1983,10 +2507,10 @@ export class BikeSafetyEngine {
           let hazMaxZ = h.z + h.depth * 0.5;
 
           if (h.type === 'dooring') {
-            // Check both car body AND opened driver door!
-            const doorReach = h.doorOpenProgress * 1.15;
-            hazMinX = h.x - 0.95 - doorReach;
-            hazMaxX = h.x + 0.95;
+            // Check both car body AND opened driver door (leaves x ∈ [2.15, 2.65] clear inside bike lane)
+            const doorReach = h.doorOpenProgress * 0.95;
+            hazMinX = h.x - 0.92 - doorReach;
+            hazMaxX = h.x + 0.92;
           }
 
           const bikeHalfW = 0.28;
@@ -2004,7 +2528,9 @@ export class BikeSafetyEngine {
               roadwork: '공사 장애물 충돌! 전방을 살피고 미리 차선 변경하세요',
               scooter: '전방 급정거 추돌! 충분한 안전거리를 유지하세요',
               red_signal: '적색 신호 위반!',
-              traffic_car: '차도 주행 차량과 충돌! 자전거 도로를 이용하세요',
+              traffic_car: h.rearChase
+                ? '차도 3초 이상 주행 후방 추돌! 자전거 전용도로를 이용하세요'
+                : '차도 주행 차량과 충돌! 자전거 도로를 이용하세요',
               pet: '애완동물과 충돌! 인도 근처에선 서행·경적 필수입니다',
               kids: '어린이 보행자와 충돌! 스쿨존에서는 반드시 서행하세요',
               wrong_way_bike: '역주행 자전거와 정면 충돌! 전방 주시 및 감속 필수',
@@ -2012,7 +2538,10 @@ export class BikeSafetyEngine {
               gravel: '돌맹이·자갈 밟아 핸들 흔들림! 감속 후 안전하게 피하세요',
             };
             this.onHazardHit(h, msgMap[h.type]);
-          } else if (!h.nearMissAwarded && h.z > 0.3 && h.z < 2.2) {
+          } else if (
+            !h.nearMissAwarded &&
+            (h.rearChase ? h.z < -0.5 && h.z > -2.8 : h.z > 0.3 && h.z < 2.2)
+          ) {
             // Near-miss or safe defensive braking reward
             const distToEdge = Math.min(
               Math.abs(this.playerX - hazMinX),
@@ -2032,7 +2561,11 @@ export class BikeSafetyEngine {
               h.nearMissAwarded = true;
               this.nearMissCount++;
               soundEngine.playNearMiss(this.combo);
-              this.awardBonus('아슬아슬 회피!', 180, 'good');
+              this.awardBonus(
+                h.rearChase ? '후방 추돌 아슬아슬 회피!' : '아슬아슬 회피!',
+                180,
+                'good'
+              );
             }
           }
         }
@@ -2046,6 +2579,8 @@ export class BikeSafetyEngine {
       if (h.z > 14 || h.z < -170) {
         this.scene.remove(h.group);
         if (h.warningMesh) this.scene.remove(h.warningMesh);
+        if (h.trajectoryMesh) this.scene.remove(h.trajectoryMesh);
+        if (h.doorZoneMesh) this.scene.remove(h.doorZoneMesh);
         this.hazards.splice(i, 1);
       }
     }
@@ -2171,11 +2706,15 @@ export class BikeSafetyEngine {
       this.speedGradePass.uniforms.uSpeedRatio.value = speedRatio;
     }
 
-    const targetFov = 61 + speedRatio * 10;
+    const portraitBoost =
+      this.camera.aspect < 1 ? Math.min(18, (1 - this.camera.aspect) * 32) : 0;
+    const targetFov = 61 + portraitBoost + speedRatio * 10;
     this.camera.fov = THREE.MathUtils.damp(this.camera.fov, targetFov, 6, dt);
     this.camera.updateProjectionMatrix();
 
-    _vec3A.set(this.playerX * 0.88, 2.35, 4.35 + speedRatio * 0.35);
+    const camTrackFactor = this.camera.aspect < 1 ? 0.82 : 0.88;
+    const camDistOffset = this.camera.aspect < 1 ? 0.55 : 0;
+    _vec3A.set(this.playerX * camTrackFactor, 2.35, 4.35 + camDistOffset + speedRatio * 0.35);
     this.camPos.lerp(_vec3A, 1 - Math.exp(-9 * dt));
 
     if (this.shakeIntensity > 0.005) {
@@ -2211,9 +2750,11 @@ export class BikeSafetyEngine {
     const totalHits = Object.values(this.hitCounts).reduce((a, b) => a + b, 0);
 
     let grade: 'S' | 'A' | 'B' | 'C' = 'C';
-    if (cleared && totalHits === 0) grade = 'S';
-    else if ((cleared && totalHits <= 1) || this.distanceM >= 1000) grade = 'A';
-    else if (this.distanceM >= 450 || this.defensiveCount + this.nearMissCount >= 4) grade = 'B';
+    if (!this.arrestedByPolice) {
+      if (cleared && totalHits === 0) grade = 'S';
+      else if ((cleared && totalHits <= 1) || this.distanceM >= 1000) grade = 'A';
+      else if (this.distanceM >= 450 || this.defensiveCount + this.nearMissCount >= 4) grade = 'B';
+    }
 
     this.pushHud(true);
     this.callbacks.onPhaseChange(this.phase);
@@ -2231,7 +2772,188 @@ export class BikeSafetyEngine {
       hitCounts: { ...this.hitCounts },
       encounterCounts: { ...this.encounterCounts },
       lastFatalHazard: this.lastFatalHazard,
+      arrestedByPolice: this.arrestedByPolice,
     });
+  }
+
+  private computeActiveForecast(): ForecastAlert | null {
+    if (this.phase !== 'playing') return null;
+
+    let bestHazard: ActiveHazard | null = null;
+    let bestScore = Infinity;
+
+    for (const h of this.hazards) {
+      if (h.hit || h.z > -4 || h.z < -76) continue;
+      // Ignore already-satisfied red signals
+      if (h.type === 'red_signal' && h.defensiveAwarded) continue;
+
+      const dist = -h.z;
+      // Prioritize bike-lane / crossing hazards unless player actually enters a car's lane
+      const isCarTraffic = h.type === 'traffic_car';
+      const inCarPath = Math.abs(this.playerX - h.x) < 1.35;
+      const priorityBias = isCarTraffic && !inCarPath ? 24 : 0;
+      const score = dist + priorityBias;
+
+      if (score < bestScore) {
+        bestScore = score;
+        bestHazard = h;
+      }
+    }
+
+    if (!bestHazard) return null;
+
+    const distanceM = Math.max(1, Math.round(-bestHazard.z));
+    switch (bestHazard.type) {
+      case 'traffic_car':
+        return bestHazard.sideDir < 0
+          ? {
+              id: bestHazard.id,
+              title: '전방 맞은편 자동차 출현',
+              detail: '좌측 차로에서 정면으로 다가오는 중 ↓ · 자전거 전용도로 유지',
+              dir: 'down',
+              distanceM,
+              tone: 'rose',
+            }
+          : {
+              id: bestHazard.id,
+              title: bestHazard.x > 0.4 ? '우측 차도 주행 자동차 출현' : '전방 차도 주행 자동차 출현',
+              detail: '차도 차량 주행 중 ↑ · 붉은 자전거 전용도로 내에서 주행하세요',
+              dir: 'up',
+              distanceM,
+              tone: 'sky',
+            };
+      case 'blind_car':
+        return {
+          id: bestHazard.id,
+          title: '전방 골목 자동차 출현',
+          detail:
+            bestHazard.sideDir < 0
+              ? '우측 골목에서 차도로 진입 중 ← · S키 감속'
+              : '좌측 골목에서 차도로 진입 중 → · S키 감속',
+          dir: bestHazard.sideDir < 0 ? 'left' : 'right',
+          distanceM,
+          tone: 'rose',
+        };
+      case 'dooring':
+        return {
+          id: bestHazard.id,
+          title: '전방 주차 자동차 출현',
+          detail: '운전석 문 열림(←) 위험 · 좌측으로 1m 안전거리 확보',
+          dir: 'left',
+          distanceM,
+          tone: 'amber',
+        };
+      case 'smombie':
+        return {
+          id: bestHazard.id,
+          title: '전방 사람(보행자) 출현',
+          detail: bestHazard.alertedByBell
+            ? '인도 쪽(→)으로 안전 이동 완료'
+            : '자전거 도로 쪽으로 진입 중 ← · 경적(E/Space) 또는 우회',
+          dir: bestHazard.alertedByBell ? 'right' : 'left',
+          distanceM,
+          tone: bestHazard.alertedByBell ? 'sky' : 'amber',
+        };
+      case 'kids':
+        return {
+          id: bestHazard.id,
+          title: '전방 어린이 보행자 출현',
+          detail: bestHazard.alertedByBell
+            ? '인도 쪽(→)에서 대기 중 · 서행 통과'
+            : '도로 쪽(←) 돌발 이동 주의 · 서행 및 경적(E/Space)',
+          dir: bestHazard.alertedByBell ? 'right' : 'left',
+          distanceM,
+          tone: bestHazard.alertedByBell ? 'sky' : 'amber',
+        };
+      case 'pet':
+        return {
+          id: bestHazard.id,
+          title: '전방 애완동물 출현',
+          detail: bestHazard.alertedByBell
+            ? '인도 쪽(→)으로 멈춤 · 안전 통과'
+            : '인도에서 도로 쪽(←)으로 돌진 · 감속(S) 및 경적',
+          dir: bestHazard.alertedByBell ? 'right' : 'left',
+          distanceM,
+          tone: bestHazard.alertedByBell ? 'sky' : 'rose',
+        };
+      case 'wrong_way_bike':
+        return {
+          id: bestHazard.id,
+          title: '전방 역주행 자전거 출현',
+          detail: '정면에서 마주 다가오는 중 ↓ · 감속 후 좌측 우회',
+          dir: 'down',
+          distanceM,
+          tone: 'rose',
+        };
+      case 'scooter':
+        return {
+          id: bestHazard.id,
+          title: '전방 배달 오토바이 출현',
+          detail: bestHazard.braking
+            ? '급정거 중! 브레이크(S) 또는 안전 우회'
+            : '앞으로 주행 중 ↑ · 갑작스러운 급정거 주의',
+          dir: bestHazard.braking ? 'stop' : 'up',
+          distanceM,
+          tone: bestHazard.braking ? 'rose' : 'amber',
+        };
+      case 'red_signal':
+        return {
+          id: bestHazard.id,
+          title: '전방 횡단보도 신호등',
+          detail: bestHazard.alwaysGreen
+            ? '초록 신호 · 좌우 살피며 안전 통과'
+            : bestHazard.signalState === 'red'
+            ? '적색 신호! 흰색 정지선 앞에서 감속 정지(S/브레이크)'
+            : bestHazard.signalState === 'yellow'
+            ? '황색 신호! 정지선 앞 감속 준비(S/브레이크)'
+            : '교차로 신호등 색상을 확인하세요',
+          dir: bestHazard.alwaysGreen ? 'up' : 'stop',
+          distanceM: bestHazard.alwaysGreen
+            ? distanceM
+            : Math.max(1, Math.round(-(bestHazard.z + 4.6))),
+          tone: bestHazard.alwaysGreen
+            ? 'sky'
+            : bestHazard.signalState === 'red'
+            ? 'rose'
+            : 'amber',
+        };
+      case 'pothole':
+        return {
+          id: bestHazard.id,
+          title: '전방 배수구·포트홀 주의',
+          detail: '노면 함몰 위험 · 감속(S) 후 좌우로 우회',
+          dir: 'left',
+          distanceM,
+          tone: 'amber',
+        };
+      case 'puddle':
+        return {
+          id: bestHazard.id,
+          title: '전방 물웅덩이 출현',
+          detail: '수막현상 미끄럼 주의 · 감속 후 우회',
+          dir: 'left',
+          distanceM,
+          tone: 'sky',
+        };
+      case 'gravel':
+        return {
+          id: bestHazard.id,
+          title: '전방 돌맹이·자갈 노면',
+          detail: '핸들 흔들림 위험 · 감속 후 안전 우회',
+          dir: 'left',
+          distanceM,
+          tone: 'amber',
+        };
+      case 'roadwork':
+        return {
+          id: bestHazard.id,
+          title: '전방 도로 공사 구간',
+          detail: '라바콘 장애물 · 전방 확인 후 차로 변경',
+          dir: 'left',
+          distanceM,
+          tone: 'amber',
+        };
+    }
   }
 
   private pushHud(force: boolean): void {
@@ -2258,6 +2980,7 @@ export class BikeSafetyEngine {
       zoneIndex: zone.index,
       activeCallout: this.activeCallout,
       activeWarning: this.activeWarning,
+      activeForecast: this.computeActiveForecast(),
       nearMissCount: this.nearMissCount,
       defensiveCount: this.defensiveCount,
       hitCounts: { ...this.hitCounts },
@@ -2291,6 +3014,8 @@ export class BikeSafetyEngine {
     this.potholeTex?.dispose();
     this.puddleTex?.dispose();
     this.chevronTex?.dispose();
+    this.trajectoryTex?.dispose();
+    this.doorZoneTex?.dispose();
     this.roadNormalTex?.dispose();
     this.roadRoughnessTex?.dispose();
     this.sidewalkTex?.dispose();

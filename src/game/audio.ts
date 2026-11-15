@@ -322,6 +322,76 @@ class SoundEngine {
     gain.connect(ctx.destination);
     noise.start(now);
   }
+
+  public playPoliceSiren(): void {
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    // Classic alternating high-low police siren sweeps
+    const steps = [
+      { t: 0.0, f1: 660, f2: 960, d: 0.28 },
+      { t: 0.28, f1: 960, f2: 640, d: 0.28 },
+      { t: 0.56, f1: 660, f2: 960, d: 0.28 },
+      { t: 0.84, f1: 960, f2: 640, d: 0.28 },
+    ];
+    steps.forEach((s) => {
+      const start = now + s.t;
+      const osc = ctx.createOscillator();
+      const filter = ctx.createBiquadFilter();
+      const gain = ctx.createGain();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(s.f1, start);
+      osc.frequency.linearRampToValueAtTime(s.f2, start + s.d);
+
+      filter.type = 'bandpass';
+      filter.frequency.value = 1050;
+      filter.Q.value = 1.4;
+
+      gain.gain.setValueAtTime(0.001, start);
+      gain.gain.linearRampToValueAtTime(0.08, start + 0.04);
+      gain.gain.setValueAtTime(0.075, start + s.d - 0.04);
+      gain.gain.exponentialRampToValueAtTime(0.001, start + s.d);
+
+      osc.connect(filter);
+      filter.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(start);
+      osc.stop(start + s.d + 0.02);
+    });
+  }
+
+  public playPoliceWhistle(): void {
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    [0, 0.16].forEach((offset) => {
+      const t = now + offset;
+      const osc = ctx.createOscillator();
+      const lfo = ctx.createOscillator();
+      const lfoGain = ctx.createGain();
+      const gain = ctx.createGain();
+
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(2550, t);
+      lfo.type = 'sine';
+      lfo.frequency.value = 38;
+      lfoGain.gain.value = 140;
+
+      lfo.connect(lfoGain);
+      lfoGain.connect(osc.frequency);
+
+      gain.gain.setValueAtTime(0.001, t);
+      gain.gain.linearRampToValueAtTime(0.09, t + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.13);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(t);
+      lfo.start(t);
+      osc.stop(t + 0.14);
+      lfo.stop(t + 0.14);
+    });
+  }
 }
 
 export const soundEngine = new SoundEngine();
